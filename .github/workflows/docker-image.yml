@@ -93,4 +93,4 @@ jobs:
       # 步骤七：登出 ACR (安全起见)
       - name: Logout from ACR
         if: always() # 无论前面的步骤是否成功，都执行登出
-        run: docker logout ${{ secrets.ACR_REGISTRY }}
+        run: docker logout ${{ env.ALIYUN_REGISTRY }}
