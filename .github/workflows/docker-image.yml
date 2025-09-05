@@ -84,7 +84,7 @@ jobs:
           # KUBE_DOCKER_REGISTRY: 覆盖默认的 registry.k8s.io，指向我们的 ACR
           # KUBE_DOCKER_IMAGE_TAG: 指定镜像的标签
           export KUBE_BUILD_PLATFORMS=linux/amd64
-          export KUBE_DOCKER_REGISTRY="${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}"
+          export KUBE_DOCKER_REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}"
           export KUBE_DOCKER_IMAGE_TAG="${{ env.IMAGE_TAG }}"
 
           # 调用 Makefile 来构建单个组件的镜像
