@@ -90,13 +90,10 @@ jobs:
           # 构造一个符合 SemVer 规范的开发版本号
           # 格式: 0.0.0-dev.<commit_sha>
           # 这样既保证了唯一性，又符合 SemVer
-          VERSION_TAG="0.0.0-dev+${GITHUB_SHA::7}"
-          echo "Forcing build version to: ${VERSION_TAG}"
 
           KUBE_BUILD_PLATFORMS=linux/amd64 \
           KUBE_DOCKER_REGISTRY="${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}" \
           KUBE_FASTBUILD=true \
-          KUBE_GIT_VERSION="${VERSION_TAG}" \
           ./build/release-images.sh "${{ env.K8S_COMPONENT }}"
 
       # 步骤七：登出 ACR (安全起见)
