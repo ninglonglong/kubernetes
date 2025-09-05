@@ -57,9 +57,9 @@ jobs:
       - name: Log in to Alibaba Cloud Container Registry (ACR)
         uses: docker/login-action@v3
         with:
-          registry: $ALIYUN_NAME_SPACE
-          username: $ALIYUN_REGISTRY_USER
-          password: $ALIYUN_REGISTRY_PASSWORD
+          registry: ${{ env.ALIYUN_NAME_SPACE}}
+          username: ${{ env.ALIYUN_REGISTRY_USER}}
+          password: ${{ env.ALIYUN_REGISTRY_PASSWORD}}
 
       # 步骤五：确定镜像标签
       - name: Determine Image Tag
