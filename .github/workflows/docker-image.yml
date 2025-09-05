@@ -41,6 +41,7 @@ jobs:
         with:
           # Kubernetes 源码包含子模块，需要拉取
           submodules: true
+          fetch-depth: 0
 
       # 步骤二：设置 Go 环境 (Kubernetes 构建需要)
       - name: Set up Go
