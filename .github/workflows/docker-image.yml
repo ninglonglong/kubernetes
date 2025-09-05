@@ -88,7 +88,7 @@ jobs:
           export KUBE_DOCKER_IMAGE_TAG="${{ env.IMAGE_TAG }}"
 
           # 调用 Makefile 来构建单个组件的镜像
-          make ${{ env.K8S_COMPONENT }}.image
+          ./build/release-images.sh "${{ env.K8S_COMPONENT }}"
 
       # 步骤七：登出 ACR (安全起见)
       - name: Logout from ACR
