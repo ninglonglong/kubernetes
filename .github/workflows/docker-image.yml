@@ -41,7 +41,6 @@ jobs:
         with:
           # Kubernetes 源码包含子模块，需要拉取
           submodules: true
-          fetch-depth: 0
 
       # 步骤二：设置 Go 环境 (Kubernetes 构建需要)
       - name: Set up Go
@@ -94,8 +93,7 @@ jobs:
           KUBE_BUILD_PLATFORMS=linux/amd64 \
           KUBE_DOCKER_REGISTRY="${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}" \
           KUBE_FASTBUILD=true \
-          # 调用 Makefile 来构建单个组件的镜像
-          KUBE_GIT_VERSION="${VERSION_TAG}" \ # <-- 这是解决问题的关键一行！
+          KUBE_GIT_VERSION="${VERSION_TAG}" \
           ./build/release-images.sh "${{ env.K8S_COMPONENT }}"
 
       # 步骤七：登出 ACR (安全起见)
