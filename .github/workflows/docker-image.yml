@@ -79,15 +79,18 @@ jobs:
           echo "Target Registry: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}"
           echo "Image Tag: ${{ env.IMAGE_TAG }}"
 
-          # 设置关键环境变量，告诉 K8s 的 Makefile 如何构建和推送
-          # KUBE_BUILD_PLATFORMS: 指定目标平台
-          # KUBE_DOCKER_REGISTRY: 覆盖默认的 registry.k8s.io，指向我们的 ACR
-          # KUBE_DOCKER_IMAGE_TAG: 指定镜像的标签
+         
           export KUBE_BUILD_PLATFORMS=linux/amd64
           export KUBE_DOCKER_REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}"
           export KUBE_DOCKER_IMAGE_TAG="${{ env.IMAGE_TAG }}"
           # 使用您在 workflow_dispatch 中输入的 tag，或者 commit SHA 作为强制版本号
-          VERSION_TAG=${{ github.event.inputs.image_tag || format('git-{0}', github.sha) }}
+          
+          #VERSION_TAG=${{ github.event.inputs.image_tag || format('git-{0}', github.sha) }}
+                # ---- 修改这里的逻辑 ----
+          # 构造一个符合 SemVer 规范的开发版本号
+          # 格式: 0.0.0-dev.<commit_sha>
+          # 这样既保证了唯一性，又符合 SemVer
+          VERSION_TAG="0.0.0-dev.${{ github.sha }}"
           echo "Forcing build version to: ${VERSION_TAG}"
 
           KUBE_BUILD_PLATFORMS=linux/amd64 \
