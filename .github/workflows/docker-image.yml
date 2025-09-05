@@ -15,7 +15,7 @@ on:
   # 当有代码推送到 dev 分支时自动触发
   push:
     branches:
-      - 'dev' # 您可以修改为您进行开发的分支名
+      - 'master' # 您可以修改为您进行开发的分支名
 
 # 3. 定义环境变量，方便统一管理
 env:
@@ -41,6 +41,8 @@ jobs:
         with:
           # Kubernetes 源码包含子模块，需要拉取
           submodules: true
+          fetch-depth: 0 
+          fetch-tags: true
 
       # 步骤二：设置 Go 环境 (Kubernetes 构建需要)
       - name: Set up Go
