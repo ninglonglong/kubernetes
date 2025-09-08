@@ -94,7 +94,7 @@ jobs:
           # 这样既保证了唯一性，又符合 SemVer
 
           KUBE_BUILD_PLATFORMS=linux/amd64 \
-          KUBE_DOCKER_REGISTRY="${{ secrets.ACR_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}" \
+          KUBE_DOCKER_REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}" \
           KUBE_FASTBUILD=true \
           KUBE_BUILD_PARALLEL=1 \
           ./build/release-images.sh "${{ env.K8S_COMPONENT }}"
