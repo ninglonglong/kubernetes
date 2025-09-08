@@ -132,29 +132,21 @@ jobs:
   # 这样可以清晰地分离“检测”和“执行”
   # ------------------------------------------------------------------
   build-and-push-components:
-    # 依赖上一个作业，确保检测完成后再执行
     needs: build-and-push
     runs-on: ubuntu-latest
-    
-    # 使用 if 条件，只有在至少有一个组件需要构建时才运行此作业
     if: >
       needs.build-and-push.outputs.build-apiserver == 'true' ||
       needs.build-and-push.outputs.build-controller-manager == 'true' ||
       needs.build-and-push.outputs.build-scheduler == 'true' ||
       needs.build-and-push.outputs.build-proxy == 'true'
       
-    # 为构建步骤设置环境变量
     env:
-      # K8s 构建脚本会读取这些环境变量
       KUBE_BUILD_PLATFORMS: linux/amd64
       KUBE_DOCKER_REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAME_SPACE }}
       KUBE_DOCKER_IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
       KUBE_FASTBUILD: true
-      # 你可以根据 runner 的性能调整并行度
-      # KUBE_BUILD_PARALLEL: 2
 
     steps:
-      # 需要再次检出代码，因为这是一个新的作业
       - name: Checkout Kubernetes source code
         uses: actions/checkout@v4
         with:
@@ -174,32 +166,29 @@ jobs:
           username: ${{ secrets.ALIYUN_REGISTRY_USER }}
           password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
 
-      # ------------------------------------------------------------------
-      # 条件构建步骤
-      # ------------------------------------------------------------------
       - name: Build and Push kube-apiserver
         if: needs.build-and-push.outputs.build-apiserver == 'true'
         run: |
           echo "Building & Pushing kube-apiserver with tag ${{ env.KUBE_DOCKER_IMAGE_TAG }}"
-          make WHAT=cmd/kube-apiserver push-images
+          ./build/release-images.sh kube-apiserver
 
       - name: Build and Push kube-controller-manager
         if: needs.build-and-push.outputs.build-controller-manager == 'true'
         run: |
           echo "Building & Pushing kube-controller-manager with tag ${{ env.KUBE_DOCKER_IMAGE_TAG }}"
-          make WHAT=cmd/kube-controller-manager push-images
+          ./build/release-images.sh kube-controller-manager
 
       - name: Build and Push kube-scheduler
         if: needs.build-and-push.outputs.build-scheduler == 'true'
         run: |
           echo "Building & Pushing kube-scheduler with tag ${{ env.KUBE_DOCKER_IMAGE_TAG }}"
-          make WHAT=cmd/kube-scheduler push-images
+          ./build/release-images.sh kube-scheduler
 
       - name: Build and Push kube-proxy
         if: needs.build-and-push.outputs.build-proxy == 'true'
         run: |
           echo "Building & Pushing kube-proxy with tag ${{ env.KUBE_DOCKER_IMAGE_TAG }}"
-          make WHAT=cmd/kube-proxy push-images
+          ./build/release-images.sh kube-proxy
 
       - name: Logout from ACR
         if: always()
