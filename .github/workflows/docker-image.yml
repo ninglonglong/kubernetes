@@ -98,7 +98,7 @@ jobs:
           KUBE_FASTBUILD=true \
           KUBE_BUILD_PARALLEL=1 \
           ./build/release-images.sh "${{ env.K8S_COMPONENT }}"
-          docker push  $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${{ env.K8S_COMPONENT }}:${{ env.IMAGE_TAG }}
+          docker push  $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${{ env.K8S_COMPONENT }}-amd64:${{ env.IMAGE_TAG }}
           echo "Image pushed successfully!"
 
 
