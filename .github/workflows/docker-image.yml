@@ -102,11 +102,8 @@ jobs:
       - name: Push The Final Image to ACR
         run: |
           # 使用 env 变量构造最终的镜像名
-          IMAGE_NAME="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${{ env.K8S_COMPONENT }}"
-          IMAGE_TAG="${{ env.IMAGE_TAG }}"
-          
-          echo "Pushing image: ${IMAGE_NAME}:${IMAGE_TAG}"
-          docker push "${IMAGE_NAME}:${IMAGE_TAG}"
+          echo "Pushing image: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${{ env.K8S_COMPONENT }}:${{ env.IMAGE_TAG }}"
+          docker push "${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${{ env.K8S_COMPONENT }}":"${{ env.IMAGE_TAG }}"
           echo "Image pushed successfully!"
 
       # 步骤七：登出 ACR (安全起见)
