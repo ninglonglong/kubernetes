@@ -98,6 +98,14 @@ jobs:
           KUBE_FASTBUILD=true \
           KUBE_BUILD_PARALLEL=1 \
           ./build/release-images.sh "${{ env.K8S_COMPONENT }}"
+      - name: Push The Final Image to ACR
+        run: |
+          IMAGE_NAME="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${{ env.K8S_COMPONENT }}"
+          IMAGE_TAG="${{ env.FINAL_IMAGE_TAG }}"
+          
+          echo "Pushing image: ${IMAGE_NAME}:${IMAGE_TAG}"
+          docker push "${IMAGE_NAME}:${IMAGE_TAG}"
+          echo "Image pushed successfully!"
 
       # 步骤七：登出 ACR (安全起见)
       - name: Logout from ACR
