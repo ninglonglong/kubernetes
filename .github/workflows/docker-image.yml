@@ -1,108 +1,206 @@
 # .github/workflows/build-and-push-to-acr.yml
 
-# 1. 工作流名称
-name: Build K8s Image and Push to ACR
+name: Build K8s Changed Images and Push to ACR
 
-# 2. 触发条件
 on:
-  # 允许手动在 Actions 页面点击 "Run workflow" 来触发
+  # 允许手动触发，这时会构建所有组件
   workflow_dispatch:
     inputs:
       image_tag:
         description: 'Image tag (e.g., dev, latest, or a version number)'
         required: true
         default: 'latest'
-  # 当有代码推送到 dev 分支时自动触发
+  # 当有代码推送到 master 分支时自动触发
   push:
     branches:
       - 'master' # 您可以修改为您进行开发的分支名
 
-# 3. 定义环境变量，方便统一管理
 env:
-  # 镜像要推送到的 ACR 命名空间
-  # 要构建的 Kubernetes 组件名称
-  K8S_COMPONENT: kube-scheduler
-  ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
-  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
-  ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
-  ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+  # 镜像仓库信息，从 Secrets 读取
+  ALIYUN_REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+  ALIYUN_NAME_SPACE: ${{ secrets.ALIYUN_NAME_SPACE }}
+  ALIYUN_REGISTRY_USER: ${{ secrets.ALIYUN_REGISTRY_USER }}
+  ALIYUN_REGISTRY_PASSWORD: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
 
-# 4. 定义作业
 jobs:
   build-and-push:
-    # 作业运行的环境
     runs-on: ubuntu-latest
+    
+    # 这一步很关键，用于在步骤之间传递输出变量
+    outputs:
+      image_tag: ${{ steps.image_tag.outputs.IMAGE_TAG }}
+      build-apiserver: ${{ steps.detect-changes.outputs.build-apiserver }}
+      build-controller-manager: ${{ steps.detect-changes.outputs.build-controller-manager }}
+      build-scheduler: ${{ steps.detect-changes.outputs.build-scheduler }}
+      build-proxy: ${{ steps.detect-changes.outputs.build-proxy }}
 
-    # 作业中的一系列步骤
     steps:
-      # 步骤一：检出代码
       - name: Checkout Kubernetes source code
         uses: actions/checkout@v4
         with:
-          # Kubernetes 源码包含子模块，需要拉取
           submodules: true
-          fetch-depth: 0 
+          fetch-depth: 0 # 必须获取完整历史，以便 git diff
           fetch-tags: true
 
-      # 步骤二：设置 Go 环境 (Kubernetes 构建需要)
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # 建议指定一个与 k8s 源码匹配的 Go 版本
           go-version: '1.22'
 
-      # 步骤三：设置 Docker Buildx (最佳实践，用于多平台构建)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 步骤四：登录到阿里云 ACR
-      # - name: Log in to Alibaba Cloud Container Registry (ACR)
-      #   uses: docker/login-action@v3
-      #   with:
-      #     registry: ${{ env.ALIYUN_REGISTRY}}
-      #     username: ${{ env.ALIYUN_REGISTRY_USER}}
-      #     password: ${{ env.ALIYUN_REGISTRY_PASSWORD}}
+      - name: Log in to Alibaba Cloud Container Registry (ACR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ env.ALIYUN_REGISTRY_USER }}
+          password: ${{ env.ALIYUN_REGISTRY_PASSWORD }}
 
-      # 步骤五：确定镜像标签
       - name: Determine Image Tag
         id: image_tag
         run: |
-          # 如果是手动触发，使用输入的 tag；如果是 push 触发，使用 commit SHA 的前7位
-          TAG=${{ github.event.inputs.image_tag || format('{0}', github.sha) }}
+          # 手动触发使用输入，自动触发使用 commit SHA 前7位
+          TAG=${{ github.event.inputs.image_tag || github.sha }}
           SHORT_TAG=${TAG::7}
-          echo "IMAGE_TAG=${SHORT_TAG}" >> $GITHUB_ENV
-          echo "Using tag: ${SHORT_TAG}"
+          echo "IMAGE_TAG=${SHORT_TAG}" >> $GITHUB_OUTPUT
+          echo "Final image tag will be: ${SHORT_TAG}"
 
-      # 步骤六：构建 Kubernetes 组件镜像并推送
-      # 这是最核心的一步！
-      - name: Build and Push Kubernetes Image
+      # ------------------------------------------------------------------
+      # 核心步骤：变更检测
+      # ------------------------------------------------------------------
+      - name: Detect changed components
+        id: detect-changes
         run: |
-          echo "Starting build for ${{ env.K8S_COMPONENT }}..."
-          echo "Target Registry: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}"
-          echo "Image Tag: ${{ env.IMAGE_TAG }}"
-          docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
-         
-          export KUBE_BUILD_PLATFORMS=linux/amd64
-          export KUBE_DOCKER_REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}"
-          export KUBE_DOCKER_IMAGE_TAG="${{ env.IMAGE_TAG }}"
-          # 使用您在 workflow_dispatch 中输入的 tag，或者 commit SHA 作为强制版本号
+          # 定义每个组件的源码路径
+          declare -A COMPONENT_PATHS
+          COMPONENT_PATHS["apiserver"]="cmd/kube-apiserver/"
+          COMPONENT_PATHS["controller-manager"]="cmd/kube-controller-manager/"
+          COMPONENT_PATHS["scheduler"]="cmd/kube-scheduler/"
+          COMPONENT_PATHS["proxy"]="cmd/kube-proxy/"
+
+          # 定义可能影响所有组件的公共路径
+          COMMON_PATHS="pkg/ staging/ vendor/ go.mod go.sum build/"
           
-          #VERSION_TAG=${{ github.event.inputs.image_tag || format('git-{0}', github.sha) }}
-                # ---- 修改这里的逻辑 ----
-          # 构造一个符合 SemVer 规范的开发版本号
-          # 格式: 0.0.0-dev.<commit_sha>
-          # 这样既保证了唯一性，又符合 SemVer
+          # 默认所有组件都不需要构建
+          BUILD_ALL="false"
+          BUILD_APISERVER="false"
+          BUILD_CONTROLLER_MANAGER="false"
+          BUILD_SCHEDULER="false"
+          BUILD_PROXY="false"
 
-          KUBE_BUILD_PLATFORMS=linux/amd64 \
-          KUBE_DOCKER_REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}" \
-          KUBE_FASTBUILD=true \
-          KUBE_BUILD_PARALLEL=1 \
-          ./build/release-images.sh "${{ env.K8S_COMPONENT }}"
-          docker push  $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${{ env.K8S_COMPONENT }}-amd64:${{ env.IMAGE_TAG }}
-          echo "Image pushed successfully!"
+          # 如果是手动触发 (workflow_dispatch)，则构建所有组件
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual trigger detected. Building all components."
+            BUILD_ALL="true"
+          else
+            # 自动触发，则进行变更检测
+            CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
 
+            for path in $COMMON_PATHS; do
+              if echo "$CHANGED_FILES" | grep -q "^$path"; then
+                echo "Change detected in common path '$path'. Building all components."
+                BUILD_ALL="true"
+                break
+              fi
+            done
+          fi
 
-      # 步骤七：登出 ACR (安全起见)
+          if [ "$BUILD_ALL" == "true" ]; then
+            BUILD_APISERVER="true"
+            BUILD_CONTROLLER_MANAGER="true"
+            BUILD_SCHEDULER="true"
+            BUILD_PROXY="true"
+          else
+            # 仅检查特定组件的变更
+            if echo "$CHANGED_FILES" | grep -q "^${COMPONENT_PATHS['apiserver']}"; then echo "Change detected in kube-apiserver."; BUILD_APISERVER="true"; fi
+            if echo "$CHANGED_FILES" | grep -q "^${COMPONENT_PATHS['controller-manager']}"; then echo "Change detected in kube-controller-manager."; BUILD_CONTROLLER_MANAGER="true"; fi
+            if echo "$CHANGED_FILES" | grep -q "^${COMPONENT_PATHS['scheduler']}"; then echo "Change detected in kube-scheduler."; BUILD_SCHEDULER="true"; fi
+            if echo "$CHANGED_FILES" | grep -q "^${COMPONENT_PATHS['proxy']}"; then echo "Change detected in kube-proxy."; BUILD_PROXY="true"; fi
+          fi
+
+          # 输出结果，供后续作业或步骤使用
+          echo "build-apiserver=${BUILD_APISERVER}" >> $GITHUB_OUTPUT
+          echo "build-controller-manager=${BUILD_CONTROLLER_MANAGER}" >> $GITHUB_OUTPUT
+          echo "build-scheduler=${BUILD_SCHEDULER}" >> $GITHUB_OUTPUT
+          echo "build-proxy=${BUILD_PROXY}" >> $GITHUB_OUTPUT
+
+  # ------------------------------------------------------------------
+  # 新增一个作业，用于实际的构建和推送
+  # 这样可以清晰地分离“检测”和“执行”
+  # ------------------------------------------------------------------
+  build-and-push-components:
+    # 依赖上一个作业，确保检测完成后再执行
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    
+    # 使用 if 条件，只有在至少有一个组件需要构建时才运行此作业
+    if: >
+      needs.build-and-push.outputs.build-apiserver == 'true' ||
+      needs.build-and-push.outputs.build-controller-manager == 'true' ||
+      needs.build-and-push.outputs.build-scheduler == 'true' ||
+      needs.build-and-push.outputs.build-proxy == 'true'
+      
+    # 为构建步骤设置环境变量
+    env:
+      # K8s 构建脚本会读取这些环境变量
+      KUBE_BUILD_PLATFORMS: linux/amd64
+      KUBE_DOCKER_REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAME_SPACE }}
+      KUBE_DOCKER_IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+      KUBE_FASTBUILD: true
+      # 你可以根据 runner 的性能调整并行度
+      # KUBE_BUILD_PARALLEL: 2
+
+    steps:
+      # 需要再次检出代码，因为这是一个新的作业
+      - name: Checkout Kubernetes source code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Log in to Alibaba Cloud Container Registry (ACR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USER }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      # ------------------------------------------------------------------
+      # 条件构建步骤
+      # ------------------------------------------------------------------
+      - name: Build and Push kube-apiserver
+        if: needs.build-and-push.outputs.build-apiserver == 'true'
+        run: |
+          echo "Building & Pushing kube-apiserver with tag ${{ env.KUBE_DOCKER_IMAGE_TAG }}"
+          make WHAT=cmd/kube-apiserver push-images
+
+      - name: Build and Push kube-controller-manager
+        if: needs.build-and-push.outputs.build-controller-manager == 'true'
+        run: |
+          echo "Building & Pushing kube-controller-manager with tag ${{ env.KUBE_DOCKER_IMAGE_TAG }}"
+          make WHAT=cmd/kube-controller-manager push-images
+
+      - name: Build and Push kube-scheduler
+        if: needs.build-and-push.outputs.build-scheduler == 'true'
+        run: |
+          echo "Building & Pushing kube-scheduler with tag ${{ env.KUBE_DOCKER_IMAGE_TAG }}"
+          make WHAT=cmd/kube-scheduler push-images
+
+      - name: Build and Push kube-proxy
+        if: needs.build-and-push.outputs.build-proxy == 'true'
+        run: |
+          echo "Building & Pushing kube-proxy with tag ${{ env.KUBE_DOCKER_IMAGE_TAG }}"
+          make WHAT=cmd/kube-proxy push-images
+
       - name: Logout from ACR
-        if: always() # 无论前面的步骤是否成功，都执行登出
+        if: always()
         run: docker logout ${{ env.ALIYUN_REGISTRY }}
