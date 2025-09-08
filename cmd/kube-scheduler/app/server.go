@@ -173,6 +173,7 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 
 	// To help debugging, immediately log version
 	logger.Info("Starting Kubernetes Scheduler", "version", utilversion.Get())
+	logger.Info("ningminglong", "version", utilversion.Get())
 
 	logger.Info("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
 
