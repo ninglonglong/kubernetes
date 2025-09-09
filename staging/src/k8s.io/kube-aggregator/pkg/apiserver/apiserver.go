@@ -19,6 +19,7 @@ package apiserver
 import (
 	"context"
 	"fmt"
+	"k8s.io/klog/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -202,19 +203,28 @@ func (cfg *Config) Complete() CompletedConfig {
 }
 
 // NewWithDelegate returns a new instance of APIAggregator from the given config.
+// NewWithDelegate 方法的作用是：基于已完成的配置和委托目标（delegate），创建并初始化一个功能完备的 APIAggregator 服务器。
+// 这个函数是 Aggregator 功能的“总装配车间”，它不仅组装了服务器，还启动了所有必要的后台控制器
 func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.DelegationTarget) (*APIAggregator, error) {
+	klog.InfoS("Creating new aggregator server with delegate")
+	// 步骤 1: 创建底层的 GenericAPIServer 实例
+	// 每个 apiserver（kube-apiserver, aggregator, apiextensions）都内嵌了一个 GenericAPIServer。
+	// 这里为 aggregator 创建它的 GenericAPIServer，并将其命名为 "kube-aggregator"。
+	// 最关键的是，它将请求的委托目标（delegate）设置为 kube-apiserver，形成了请求处理链。
 	genericServer, err := c.GenericConfig.New("kube-aggregator", delegationTarget)
 	if err != nil {
 		return nil, err
 	}
-
+	// 步骤 2: 创建用于操作 APIService 资源的客户端和 Informer 工厂
+	// Aggregator 的核心职责就是处理 APIService 资源，所以它需要自己的客户端和 Informer 来与 apiregistration.k8s.io API 组交互。
+	klog.V(4).InfoS("Creating client and informer factory for apiregistration.k8s.io")
 	apiregistrationClient, err := clientset.NewForConfig(c.GenericConfig.LoopbackClientConfig)
 	if err != nil {
 		return nil, err
 	}
 	informerFactory := informers.NewSharedInformerFactory(
 		apiregistrationClient,
-		5*time.Minute, // this is effectively used as a refresh interval right now.  Might want to do something nicer later on.
+		5*time.Minute, // this is effectively used as a refresh interval right now.  Might want to do something nicer later on. // 这个 resync 周期用于定期刷新，确保状态最终一致
 	)
 
 	// apiServiceRegistrationControllerInitiated is closed when APIServiceRegistrationController has finished "installing" all known APIServices.
@@ -222,11 +232,15 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 	// Before it might have resulted in a 404 response which could have serious consequences for some controllers like  GC and NS
 	//
 	// Note that the APIServiceRegistrationController waits for APIServiceInformer to synced before doing its work.
+	// 步骤 3: 设置一个信号 channel，用于指示 APIService 注册控制器已完成初始同步
+	// 这是一个非常关键的同步机制。在所有 APIService 被正确注册之前，apiserver 的 discovery 信息是不完整的。
+	// 通过这个信号，可以确保依赖 discovery 的其他组件（如 discovery controller）在该信号被触发后再开始工作。
 	apiServiceRegistrationControllerInitiated := make(chan struct{})
 	if err := genericServer.RegisterMuxAndDiscoveryCompleteSignal("APIServiceRegistrationControllerInitiated", apiServiceRegistrationControllerInitiated); err != nil {
 		return nil, err
 	}
-
+	// 步骤 4: 配置用于代理请求到外部 APIService 的 HTTP Transport
+	// 如果配置了 EgressSelector，则使用它来获取一个自定义的 dialer，确保网络策略生效。
 	var proxyTransportDial *transport.DialHolder
 	if c.GenericConfig.EgressSelector != nil {
 		egressDialer, err := c.GenericConfig.EgressSelector.Lookup(egressselector.Cluster.AsNetworkContext())
@@ -237,30 +251,36 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 			proxyTransportDial = &transport.DialHolder{Dial: egressDialer}
 		}
 	} else if c.ExtraConfig.ProxyTransport != nil && c.ExtraConfig.ProxyTransport.DialContext != nil {
+		// 备用方案，如果 egress selector 未配置，则使用传入的 transport。
 		proxyTransportDial = &transport.DialHolder{Dial: c.ExtraConfig.ProxyTransport.DialContext}
 	}
-
+	// 步骤 5: 初始化 APIAggregator 结构体
+	// 这是 Aggregator 服务器的核心数据结构。
+	klog.V(4).InfoS("Initializing APIAggregator struct")
 	s := &APIAggregator{
-		GenericAPIServer:           genericServer,
-		delegateHandler:            delegationTarget.UnprotectedHandler(),
-		proxyTransportDial:         proxyTransportDial,
-		proxyHandlers:              map[string]*proxyHandler{},
-		handledGroupVersions:       map[string]sets.Set[string]{},
-		lister:                     informerFactory.Apiregistration().V1().APIServices().Lister(),
-		APIRegistrationInformers:   informerFactory,
-		serviceResolver:            c.ExtraConfig.ServiceResolver,
+		GenericAPIServer:           genericServer,                                                 // 内嵌的 GenericAPIServer
+		delegateHandler:            delegationTarget.UnprotectedHandler(),                         // 委托的 handler
+		proxyTransportDial:         proxyTransportDial,                                            // 代理请求时用的 dialer
+		proxyHandlers:              map[string]*proxyHandler{},                                    // 缓存已创建的 proxy handler
+		handledGroupVersions:       map[string]sets.Set[string]{},                                 // 记录已处理的 group/version
+		lister:                     informerFactory.Apiregistration().V1().APIServices().Lister(), // 用于快速查询 APIService
+		APIRegistrationInformers:   informerFactory,                                               // APIService 的 informer
+		serviceResolver:            c.ExtraConfig.ServiceResolver,                                 /// 用于将 Service 名称解析为 IP 和端口
 		openAPIConfig:              c.GenericConfig.OpenAPIConfig,
 		openAPIV3Config:            c.GenericConfig.OpenAPIV3Config,
-		proxyCurrentCertKeyContent: func() (bytes []byte, bytes2 []byte) { return nil, nil },
-		rejectForwardingRedirects:  c.ExtraConfig.RejectForwardingRedirects,
-		tracerProvider:             c.GenericConfig.TracerProvider,
+		proxyCurrentCertKeyContent: func() (bytes []byte, bytes2 []byte) { return nil, nil }, // 用于获取代理客户端证书内容的函数
+		rejectForwardingRedirects:  c.ExtraConfig.RejectForwardingRedirects,                  // 是否拒绝代理请求中的重定向
+		tracerProvider:             c.GenericConfig.TracerProvider,                           // 分布式追踪提供者
 	}
-
+	// 步骤 6: 安装 apiregistration.k8s.io API 组
+	// Aggregator 服务器自己也需要提供 API，即 APIService 资源本身 (`/apis/apiregistration.k8s.io/v1/apiservices`)。
+	// 这里将 APIService 资源的 REST Storage 安装到 GenericAPIServer 中，使其能够处理对 APIService 的 CRUD 请求。
+	klog.V(2).InfoS("Installing apiregistration.k8s.io API group")
 	apiGroupInfo := apiservicerest.NewRESTStorage(c.GenericConfig.MergedResourceConfig, c.GenericConfig.RESTOptionsGetter, false)
 	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
 		return nil, err
 	}
-
+	// 确保 apiregistration.k8s.io/v1 这个版本是启用的，因为 aggregator 的所有逻辑都依赖它。
 	enabledVersions := sets.NewString()
 	for v := range apiGroupInfo.VersionedResourcesStorageMap {
 		enabledVersions.Insert(v)
@@ -268,18 +288,28 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 	if !enabledVersions.Has(v1.SchemeGroupVersion.Version) {
 		return nil, fmt.Errorf("API group/version %s must be enabled", v1.SchemeGroupVersion.String())
 	}
-
+	// 步骤 7: 安装用于服务 /apis 路径的 Handler
+	// `/apis` 这个路径返回所有可用的 API Group 列表，它由一个特殊的 handler 处理。
+	klog.V(4).InfoS("Installing /apis discovery handler")
 	apisHandler := &apisHandler{
 		codecs:         aggregatorscheme.Codecs,
-		lister:         s.lister,
+		lister:         s.lister, // 使用 APIService lister 来获取数据，构建 API Group 列表
 		discoveryGroup: discoveryGroup(enabledVersions),
 	}
-
+	// 将 handler 包装一下，使其支持聚合发现（即合并来自不同来源的 discovery 信息）。
 	apisHandlerWithAggregationSupport := aggregated.WrapAggregatedDiscoveryToHandler(apisHandler, s.GenericAPIServer.AggregatedDiscoveryGroupManager)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", apisHandlerWithAggregationSupport)
-	s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandle("/apis/", apisHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.UnlistedHandle("/apis/", apisHandler) // 处理 /apis/ 路径
 
+	// 步骤 8: 创建并配置 APIServiceRegistrationController
+	// 这个控制器是 Aggregator 的核心！它的职责是：
+	// 1. 监听 APIService 资源的变化。
+	// 2. 当 APIService 创建或更新时，为它创建一个对应的 proxy handler，并动态地注册到 HTTP Mux 中。
+	// 3. 当 APIService 删除时，注销对应的 handler。
+	// 这就是 API 聚合的动态实现。
+	klog.V(2).InfoS("Creating APIService registration controller")
 	apiserviceRegistrationController := NewAPIServiceRegistrationController(informerFactory.Apiregistration().V1().APIServices(), s)
+	// 如果配置了代理客户端证书（用于 apiserver 安全地连接到外部 apiservice），则设置动态重载。
 	if len(c.ExtraConfig.ProxyClientCertFile) > 0 && len(c.ExtraConfig.ProxyClientKeyFile) > 0 {
 		aggregatorProxyCerts, err := dynamiccertificates.NewDynamicServingContentFromFiles("aggregator-proxy-cert", c.ExtraConfig.ProxyClientCertFile, c.ExtraConfig.ProxyClientKeyFile)
 		if err != nil {
@@ -287,26 +317,35 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 		}
 		// We are passing the context to ProxyCerts.RunOnce as it needs to implement RunOnce(ctx) however the
 		// context is not used at all. So passing a empty context shouldn't be a problem
+		// 立即加载一次证书
 		if err := aggregatorProxyCerts.RunOnce(context.Background()); err != nil {
 			return nil, err
 		}
+		// 将 registration controller 添加为监听者，当证书变化时通知它。
 		aggregatorProxyCerts.AddListener(apiserviceRegistrationController)
 		s.proxyCurrentCertKeyContent = aggregatorProxyCerts.CurrentCertKeyContent
-
+		// 添加一个 PostStartHook，在服务器启动后，启动一个 goroutine 来定期检查证书文件是否更新。
 		s.GenericAPIServer.AddPostStartHookOrDie("aggregator-reload-proxy-client-cert", func(postStartHookContext genericapiserver.PostStartHookContext) error {
 			go aggregatorProxyCerts.Run(postStartHookContext, 1)
 			return nil
 		})
 	}
 
+	// 步骤 9: 注册 PostStartHook 来启动所有后台任务
+	klog.InfoS("Registering PostStartHooks to start background controllers")
+	// 9a. 启动 Informer 工厂
 	s.GenericAPIServer.AddPostStartHookOrDie("start-kube-aggregator-informers", func(context genericapiserver.PostStartHookContext) error {
 		informerFactory.Start(context.Done())
+		// 注意：这里也启动了 `genericConfig.SharedInformerFactory`，即主 apiserver 的 informer。
+		// 确保所有 informer 都已启动。
 		c.GenericConfig.SharedInformerFactory.Start(context.Done())
 		return nil
 	})
 
 	// create shared (remote and local) availability metrics
 	// TODO: decouple from legacyregistry
+	// 9b. 创建并启动 APIService 可用性控制器 (local 和 remote)
+	// 这些控制器负责监控每个 APIService 的健康状况，并更新其 `.status.conditions` 中的 `Available` 状态。
 	metrics := availabilitymetrics.New()
 	registerIntoLegacyRegistryOnce.Do(func() { err = metrics.Register(legacyregistry.Register, legacyregistry.CustomRegister) })
 	if err != nil {
@@ -314,6 +353,7 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 	}
 
 	// always run local availability controller
+	// 启动 local 可用性控制器，它检查由本 apiserver 提供的 APIService (spec.service 为 nil) 是否可用。
 	local, err := localavailability.New(
 		informerFactory.Apiregistration().V1().APIServices(),
 		apiregistrationClient.ApiregistrationV1(),
@@ -322,14 +362,18 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 	if err != nil {
 		return nil, err
 	}
+	// 9c. 启动核心的 APIServiceRegistrationController
 	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-status-local-available-controller", func(context genericapiserver.PostStartHookContext) error {
 		// if we end up blocking for long periods of time, we may need to increase workers.
+		// 启动控制器，并传入 `apiServiceRegistrationControllerInitiated` channel。
+		// 控制器在完成初始同步后会 close 这个 channel。
 		go local.Run(5, context.Done())
 		return nil
 	})
 
 	// conditionally run remote availability controller. This could be replaced in certain
 	// generic controlplane use-cases where there is another concept of services and/or endpoints.
+	// 启动 remote 可用性控制器，它检查由外部服务提供的 APIService，通过定期向其 `healthz` 端点发送探测请求来判断可用性。
 	if !c.ExtraConfig.DisableRemoteAvailableConditionController {
 		remote, err := remoteavailability.New(
 			informerFactory.Apiregistration().V1().APIServices(),
@@ -350,10 +394,13 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 			return nil
 		})
 	}
-
+	// 9c. 启动核心的 APIServiceRegistrationController
 	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-registration-controller", func(context genericapiserver.PostStartHookContext) error {
+		// 启动控制器，并传入 `apiServiceRegistrationControllerInitiated` channel。
+		// 控制器在完成初始同步后会 close 这个 channel。
 		go apiserviceRegistrationController.Run(context.Done(), apiServiceRegistrationControllerInitiated)
 		select {
+		// 阻塞，直到初始同步完成或上下文被取消。
 		case <-context.Done():
 		case <-apiServiceRegistrationControllerInitiated:
 		}
@@ -361,6 +408,9 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 		return nil
 	})
 
+	// 9d. 创建并启动 Discovery Aggregation Controller
+	// 这个控制器负责将所有可用的 APIService 的 discovery 信息（即 `/apis/group/version` 的内容）
+	// 聚合起来，形成一个完整的 discovery 文档。
 	s.discoveryAggregationController = NewDiscoveryManager(
 		// Use aggregator as the source name to avoid overwriting native/CRD
 		// groups
@@ -371,6 +421,7 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 	s.GenericAPIServer.AddPostStartHookOrDie("apiservice-discovery-controller", func(context genericapiserver.PostStartHookContext) error {
 		// Discovery aggregation depends on the apiservice registration controller
 		// having the full list of APIServices already synced
+		// 必须等待 APIService 注册控制器完成同步，确保所有 APIService 都已就位。
 		select {
 		case <-context.Done():
 			return nil
@@ -382,9 +433,11 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 		// APIServices to the discovery document can be updated at runtime
 		// When discovery is ready, all APIServices will be present, with APIServices
 		// that have not successfully synced discovery to be present but marked as Stale.
+		// 启动 discovery manager 的 worker 来监听 APIService 的变化，并实时更新 discovery 文档。
 		discoverySyncedCh := make(chan struct{})
 		go s.discoveryAggregationController.Run(context.Done(), discoverySyncedCh)
 
+		// 阻塞，直到 discovery controller 完成第一次的同步。
 		select {
 		case <-context.Done():
 			return nil
@@ -394,7 +447,8 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 		}
 		return nil
 	})
-
+	// 9e. (可选) 启动 StorageVersion 更新器
+	// 如果启用了相关特性，会启动一个后台任务来定期更新内置资源的存储版本，用于支持平滑的存储格式升级。
 	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StorageVersionAPI) &&
 		utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerIdentity) {
 		// Spawn a goroutine in aggregator apiserver to update storage version for

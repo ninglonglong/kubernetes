@@ -51,15 +51,23 @@ func (s *ServerRunOptions) Complete(ctx context.Context) (CompletedOptions, erro
 
 	// process s.ServiceClusterIPRange from list to Primary and Secondary
 	// we process secondary only if provided by user
+	// 步骤 2: 解析 Service Cluster IP 地址范围
 	apiServerServiceIP, primaryServiceIPRange, secondaryServiceIPRange, err := getServiceIPAndRanges(s.ServiceClusterIPRanges)
 	if err != nil {
 		return CompletedOptions{}, err
 	}
+	// 步骤 3: 调用内嵌的 GenericAPIServer Options 的 Complete 方法
+	// s.Options 是一个通用的 apiserver 配置，它包含了像认证、授权、安全端口等通用设置。
+	// 这里调用它的 Complete 方法，完成这些通用配置的补全。
+	// []string{"kubernetes.default.svc", ...} 是 apiserver 的服务名称，用于生成自签名证书。
+	// []net.IP{apiServerServiceIP} 是证书需要包含的 SANs (Subject Alternative Names)。
 	controlplane, err := s.Options.Complete(ctx, []string{"kubernetes.default.svc", "kubernetes.default", "kubernetes"}, []net.IP{apiServerServiceIP})
 	if err != nil {
 		return CompletedOptions{}, err
 	}
 
+	// 步骤 4: 组装最终的 completedOptions 对象
+	// 创建一个 kube-apiserver 特有的 completedOptions 结构体。
 	completed := completedOptions{
 		CompletedOptions: controlplane,
 

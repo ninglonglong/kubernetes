@@ -745,15 +745,38 @@ func (s preparedGenericAPIServer) NonBlockingRun(stopCh <-chan struct{}, shutdow
 // NonBlockingRunWithContext spawns the secure http server. An error is
 // returned if the secure port cannot be listened on.
 // The returned channel is closed when the (asynchronous) termination is finished.
+// NonBlockingRunWithContext 函数的作用是：以非阻塞的方式启动安全的 HTTP 服务器。
+// 如果安全端口无法被监听，它会返回一个错误。
+//
+// 返回值:
+//   - <-chan struct{}: 第一个 channel (`stoppedCh`)，当服务器完全停止后，它会被关闭。
+//   - <-chan struct{}: 第二个 channel (`listenerStoppedCh`)，当服务器停止监听新连接后，它会被关闭。
+//   - error: 如果在启动监听时发生错误（如端口被占用），则返回错误。
 func (s preparedGenericAPIServer) NonBlockingRunWithContext(ctx context.Context, shutdownTimeout time.Duration) (<-chan struct{}, <-chan struct{}, error) {
 	// Use an internal stop channel to allow cleanup of the listeners on error.
+	klog.V(2).InfoS("Starting non-blocking run for prepared generic apiserver")
+
+	// 步骤 1: 创建一个内部的 stop channel (`internalStopCh`)
+	// 这个 channel 用于在函数内部发生错误时，能够干净地关闭已经启动的 Serve goroutine。
+	// 它与外部传入的 `ctx` 解耦，提供了更精细的控制。
 	internalStopCh := make(chan struct{})
 	var stoppedCh <-chan struct{}
 	var listenerStoppedCh <-chan struct{}
+	// 步骤 2: 启动安全服务 (HTTPS)
+	// 检查 SecureServingInfo 是否已配置（即 HTTPS 是否启用）以及 Handler 是否存在。
 	if s.SecureServingInfo != nil && s.Handler != nil {
 		var err error
+		klog.InfoS("Starting secure serving")
+		// **核心启动调用！**
+		// 调用 s.SecureServingInfo.Serve 方法。正如我们之前分析的，这个方法会：
+		// 1. 在一个新的 goroutine 中启动一个 `http.Server` 来监听端口并提供服务 (`server.ServeTLS`)。
+		// 2. 在另一个 goroutine 中等待 `internalStopCh` 被关闭，然后调用 `server.Shutdown()`。
+		// 3. 这个函数本身是非阻塞的，它会立即返回两个 channel 用于监控服务器的关闭状态。
 		stoppedCh, listenerStoppedCh, err = s.SecureServingInfo.Serve(s.Handler, shutdownTimeout, internalStopCh)
 		if err != nil {
+			// 如果 `Serve` 返回错误（最常见的原因是端口被占用），
+			// 我们需要立即 close `internalStopCh` 来确保 `Serve` 内部启动的
+			// “关闭监控 goroutine”能够正常退出，防止 goroutine 泄露。
 			close(internalStopCh)
 			return nil, nil, err
 		}
@@ -762,13 +785,32 @@ func (s preparedGenericAPIServer) NonBlockingRunWithContext(ctx context.Context,
 	// Now that listener have bound successfully, it is the
 	// responsibility of the caller to close the provided channel to
 	// ensure cleanup.
+	// 步骤 3: 桥接外部 context 和内部 stop channel
+	// 此时，HTTP 监听器已经成功绑定了端口，服务器即将开始或已经开始接受连接。
+	// 从现在开始，关闭服务器的责任就交给了调用者，即通过取消外部传入的 `ctx` 来触发。
+	// 这里启动一个 goroutine 来完成这个“桥接”：
 	go func() {
+		// 阻塞，直到外部的 `ctx` 被取消（例如，用户按下了 Ctrl+C，或者 Pod 收到了 SIGTERM）。
 		<-ctx.Done()
+		// 当 `ctx` 被取消后，关闭内部的 `internalStopCh`。
+		// 这会触发 `SecureServingInfo.Serve` 内部的那个“关闭监控 goroutine”，
+		// 从而调用 `http.Server.Shutdown()`，开始优雅关闭流程。
+		klog.V(1).InfoS("Received shutdown signal, closing internal stop channel", "context_error", ctx.Err())
 		close(internalStopCh)
 	}()
-
+	// 步骤 4: **执行 PostStartHooks！**
+	// 这是一个至关重要的步骤！
+	// 在确认服务器端口已经成功监听之后，但在函数返回之前，它会调用 `RunPostStartHooks`。
+	// 这个方法会并发地启动所有我们之前注册的“启动后钩子函数”。
+	// 这意味着，像 `apiservice-registration-controller`, `crd-registration-controller` 等
+	// 核心的后台控制器，是在这个时间点被真正启动的！
+	klog.InfoS("Running post-start hooks")
 	s.RunPostStartHooks(ctx)
-
+	// 步骤 5: 通知 systemd（如果适用）
+	// 如果 `kube-apiserver` 是由 systemd 管理的，这里会向 systemd 发送一个 "READY=1" 的信号。
+	// 这会通知 systemd：“我已经成功启动，并准备好接受请求了”。
+	// 这对于实现 systemd 的服务依赖和启动顺序管理非常重要。
+	// `SdNotify` 会检查 `NOTIFY_SOCKET` 环境变量，如果不存在，它就不会做任何事。
 	if _, err := systemd.SdNotify(true, "READY=1\n"); err != nil {
 		klog.Errorf("Unable to send systemd daemon successful start message: %v\n", err)
 	}

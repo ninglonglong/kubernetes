@@ -153,17 +153,44 @@ func (s *GenericAPIServer) AddPreShutdownHookOrDie(name string, hook PreShutdown
 }
 
 // RunPostStartHooks runs the PostStartHooks for the server.
+// RunPostStartHooks 的作用是：执行所有已经注册到 GenericAPIServer 的 PostStartHook (启动后钩子函数)。
+// 这个函数会在服务器成功监听端口之后被调用。
+//
+// 参数:
+//   - ctx: 一个父 context，它将被传递给每一个钩子函数，用于控制钩子函数内部 goroutine 的生命周期。
 func (s *GenericAPIServer) RunPostStartHooks(ctx context.Context) {
+	// 步骤 1: 加锁以保护内部状态
+	// `postStartHookLock` 是一个互斥锁，用于保护 `postStartHooks` map 和 `postStartHooksCalled` 标志。
+	// 这确保了在并发场景下（虽然在正常启动流程中这里不是并发的，但作为健壮的库代码，加锁是必要的），
+	// 对这些共享资源的访问是线程安全的。
 	s.postStartHookLock.Lock()
+
 	defer s.postStartHookLock.Unlock()
+	// 步骤 2: 设置标志位，表示钩子已经被调用
+	// 这个 `postStartHooksCalled` 标志位的作用是防止 `RunPostStartHooks` 被重复调用。
+	// 在 `AddPostStartHook` 方法中会检查这个标志，如果为 true，就会 panic，
+	// 因为在钩子已经开始运行后再添加新的钩子是不安全的。
 	s.postStartHooksCalled = true
 
+	// 步骤 3: 创建 PostStartHookContext
+	// `PostStartHookContext` 是一个结构体，它将所有钩子函数可能需要的共享资源打包在一起。
+	// 这是一种很好的“依赖注入”实践，避免了钩子函数需要访问全局变量。
 	context := PostStartHookContext{
+		// LoopbackClientConfig: 提供了用于连接 apiserver 自身的客户端配置。
+		// 很多控制器需要调用 apiserver 的 API，这个配置就是它们的“通行证”。
 		LoopbackClientConfig: s.LoopbackClientConfig,
-		Context:              ctx,
+		// Context: 传入的父 context，它的 Done() channel 将被用作所有钩子函数中
+		// 后台 goroutine 的停止信号。当 apiserver 关闭时，这个 context 会被取消，
+		// 从而通知所有控制器停止工作。
+		Context: ctx,
 	}
-
+	klog.V(2).InfoS("Running post-start hooks", "count", len(s.postStartHooks))
+	// 步骤 4: 遍历并并发启动所有钩子函数
+	// `s.postStartHooks` 是一个 map，key 是钩子的名称 (用于日志和调试)，value 是钩子函数本身。
 	for hookName, hookEntry := range s.postStartHooks {
+		// **核心步骤：为每一个钩子函数都启动一个新的 goroutine！**
+		// 这意味着所有的 PostStartHook 都是并发执行的，它们不会相互阻塞。
+		// 例如，`apiservice-registration-controller` 的启动不会等待 `crd-registration-controller`。
 		go runPostStartHook(hookName, hookEntry, context)
 	}
 }

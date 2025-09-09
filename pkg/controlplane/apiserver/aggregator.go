@@ -125,46 +125,89 @@ func CreateAggregatorConfig(
 	return aggregatorConfig, nil
 }
 
-func CreateAggregatorServer(aggregatorConfig aggregatorapiserver.CompletedConfig, delegateAPIServer genericapiserver.DelegationTarget, crds apiextensionsinformers.CustomResourceDefinitionInformer, crdAPIEnabled bool, apiVersionPriorities map[schema.GroupVersion]APIServicePriority) (*aggregatorapiserver.APIAggregator, error) {
+// CreateAggregatorServer 函数的作用是: 创建并配置 API Aggregator 服务器。
+// 这个服务器不仅是一个 HTTP 请求的代理，它还内含了几个“控制器”，用于将
+// 集群中存在的 API (包括内置核心 API 和 CRD 对应的 API) 自动注册为 APIService 资源。
+func CreateAggregatorServer(aggregatorConfig aggregatorapiserver.CompletedConfig, // Aggregator 自己的配置
+	delegateAPIServer genericapiserver.DelegationTarget, // 它的委托对象 (KubeAPIs 服务器)
+	crds apiextensionsinformers.CustomResourceDefinitionInformer, // CRD Informer，用于发现 CRD
+	crdAPIEnabled bool, // CRD API 是否启用
+	apiVersionPriorities map[schema.GroupVersion]APIServicePriority) (*aggregatorapiserver.APIAggregator, error) { // API 发现时的优先级
+	klog.V(2).InfoS("Creating API aggregator server")
+
+	// 步骤 1: 创建 Aggregator 服务器实例
+	// `NewWithDelegate` 方法基于配置创建服务器，并将 `delegateAPIServer` (即 KubeAPIs)
+	// 设置为其请求处理链的下一环。
 	aggregatorServer, err := aggregatorConfig.NewWithDelegate(delegateAPIServer)
 	if err != nil {
 		return nil, err
 	}
 
 	// create controllers for auto-registration
+	// 步骤 2: 创建用于“自动注册”的控制器
+	klog.V(2).InfoS("Creating controllers for auto-registration of APIServices")
+	// 2a. 创建一个专门用于操作 APIService 资源的客户端。
+
 	apiRegistrationClient, err := apiregistrationclient.NewForConfig(aggregatorConfig.GenericConfig.LoopbackClientConfig)
 	if err != nil {
 		return nil, err
 	}
+
+	// 2b. 创建 `autoRegistrationController` (自动注册控制器)。
+	// 这个控制器是核心！它的工作是：维护一组期望存在的 APIService 资源。
+	// 它会定期检查集群中是否真实存在这些 APIService，如果没有，就创建它们；如果多余，就删除它们。
+	// 它监听 APIService 资源本身的变化，以实现这种调谐。
 	autoRegistrationController := autoregister.NewAutoRegisterController(aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(), apiRegistrationClient)
+	// 2c. 收集所有需要被自动注册的内置 API 服务。
+	// `apiServicesToRegister` 会遍历 `delegateAPIServer` (KubeAPIs) 暴露的所有 API 组和版本
+	// (如 "v1", "apps/v1", "batch/v1" 等)，为它们每一个都生成一个对应的 APIService 对象，
+	// 然后调用 `autoRegistrationController.AddAPIServiceToSync` 将它们加入到期望维护的列表中。
 	apiServices := apiServicesToRegister(delegateAPIServer, autoRegistrationController, apiVersionPriorities)
 
 	type controller interface {
 		Run(workers int, stopCh <-chan struct{})
 		WaitForInitialSync()
 	}
+	// 2d. 如果 CRD API 被启用了，创建 `crdRegistrationController`。
+	// 这个控制器的工作是：监听 CRD 资源的变化。
+	// - 当一个新的 CRD 被创建时，它会为这个 CRD 对应的 API Group/Version 生成一个 APIService 对象，
+	//   然后把它交给 `autoRegistrationController` 去同步。
+	// - 当一个 CRD 被删除时，它会通知 `autoRegistrationController` 去删除对应的 APIService。
 	var crdRegistrationController controller
 	if crdAPIEnabled {
+		klog.V(2).InfoS("CRD API is enabled, creating CRD registration controller")
 		crdRegistrationController = crdregistration.NewCRDRegistrationController(
-			crds,
-			autoRegistrationController)
+			crds,                       // 监听 CRD 资源的 Informer
+			autoRegistrationController) // 将任务委托给 `autoRegistrationController`
 	}
 
+	// 步骤 3: 配置聚合发现的优先级
+	// 这会影响 `/apis` 路径下 API 组的排序。
 	// Imbue all builtin group-priorities onto the aggregated discovery
 	if aggregatorConfig.GenericConfig.AggregatedDiscoveryGroupManager != nil {
+		klog.V(4).InfoS("Setting group-version priorities for aggregated discovery")
 		for gv, entry := range apiVersionPriorities {
 			aggregatorConfig.GenericConfig.AggregatedDiscoveryGroupManager.SetGroupVersionPriority(metav1.GroupVersion(gv), int(entry.Group), int(entry.Version))
 		}
 	}
-
+	// 步骤 4: 注册一个 PostStartHook 来启动这些后台控制器
+	// `PostStartHook` 是在 apiserver 成功启动并开始监听端口之后才执行的钩子函数。
+	// 把控制器的启动放在这里，可以确保它们在 apiserver 准备好服务之后才开始工作。
+	klog.InfoS("Adding post-start hook for auto-registration controllers")
 	err = aggregatorServer.GenericAPIServer.AddPostStartHook("kube-apiserver-autoregistration", func(context genericapiserver.PostStartHookContext) error {
+		// 启动 CRD 注册控制器 (如果启用)
 		if crdAPIEnabled {
 			go crdRegistrationController.Run(5, context.Done())
 		}
+		// 启动 APIService 自动注册控制器
 		go func() {
 			// let the CRD controller process the initial set of CRDs before starting the autoregistration controller.
 			// this prevents the autoregistration controller's initial sync from deleting APIServices for CRDs that still exist.
 			// we only need to do this if CRDs are enabled on this server.  We can't use discovery because we are the source for discovery.
+			// **这是一个非常重要的同步逻辑**
+			// 必须先等待 `crdRegistrationController` 完成对现有 CRD 的初始同步 (Initial Sync)。
+			// 这样可以确保 `autoRegistrationController` 在启动时，已经知道了所有存量 CRD 对应的 APIService。
+			// 如果不等待，`autoRegistrationController` 可能会错误地认为这些 CRD 对应的 APIService 是多余的而将它们删除。
 			if crdAPIEnabled {
 				klog.Infof("waiting for initial CRD sync...")
 				crdRegistrationController.WaitForInitialSync()
@@ -172,6 +215,7 @@ func CreateAggregatorServer(aggregatorConfig aggregatorapiserver.CompletedConfig
 			} else {
 				klog.Infof("CRD API not enabled, starting APIService registration without waiting for initial CRD sync")
 			}
+			// 真正启动 `autoRegistrationController` 的调谐循环。
 			autoRegistrationController.Run(5, context.Done())
 		}()
 		return nil
@@ -179,18 +223,24 @@ func CreateAggregatorServer(aggregatorConfig aggregatorapiserver.CompletedConfig
 	if err != nil {
 		return nil, err
 	}
-
+	// 步骤 5: 添加一个健康检查，确保自动注册完成
+	// 这个健康检查会一直失败，直到所有期望的内置 API (由 `apiServices` 列表定义)
+	// 都成功注册为 APIService 并且状态为 "Available"。
+	// 这可以防止 apiserver 过早地宣告自己“健康”，而实际上它的 API 还没有完全准备好。
+	klog.InfoS("Adding health check for APIService auto-registration completion")
 	err = aggregatorServer.GenericAPIServer.AddBootSequenceHealthChecks(
 		makeAPIServiceAvailableHealthCheck(
-			"autoregister-completion",
-			apiServices,
-			aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(),
+			"autoregister-completion", // 健康检查的名称
+			apiServices,               // 期望可用的 APIService 列表
+			aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(), // 用于检查 APIService 状态的 Informer
 		),
 	)
 	if err != nil {
 		return nil, err
 	}
 
+	// 步骤 6: 返回配置完成的 Aggregator 服务器
+	klog.InfoS("Aggregator server created and configured successfully")
 	return aggregatorServer, nil
 }
 

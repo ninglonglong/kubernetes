@@ -644,6 +644,13 @@ func (o *BuiltInAuthenticationOptions) ToAuthenticationConfig() (kubeauthenticat
 
 // ApplyTo requires already applied OpenAPIConfig and EgressSelector if present.
 // The input context controls the lifecycle of background goroutines started to reload the authentication config file.
+
+// ApplyTo 函数的作用是: 将所有内置的认证选项应用到 `genericapiserver.AuthenticationInfo` 上。
+// 这个函数是认证配置的“主装配线”。
+// - `ctx`: 控制后台 goroutine 的生命周期，主要用于动态重载认证配置文件。
+// - `authInfo`: 这是最终要被填充的认证信息对象，包含了认证器链。
+// - `secureServing`: 用于应用客户端 CA 证书。
+// - `extclient` 和 `versionedInformer`: 用于与 Kubernetes API 交互，例如获取 ServiceAccount、Secret 等资源。
 func (o *BuiltInAuthenticationOptions) ApplyTo(
 	ctx context.Context,
 	authInfo *genericapiserver.AuthenticationInfo,
@@ -654,45 +661,69 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(
 	extclient kubernetes.Interface,
 	versionedInformer informers.SharedInformerFactory,
 	apiServerID string) error {
+	klog.V(2).InfoS("Applying builtin authentication options")
+	// 步骤 1: 基本的防御性检查
+
 	if o == nil {
 		return nil
 	}
 
 	if openAPIConfig == nil {
+		// OpenAPIConfig 是必需的，因为它需要被更新以包含认证相关的安全定义（例如，Bearer Token）。
 		return errors.New("uninitialized OpenAPIConfig")
 	}
 
+	// 步骤 2: 将命令行选项转换为统一的认证配置结构体
+	// `o` 是从命令行参数解析来的，而 `authenticatorConfig` 是一个更结构化、更通用的配置对象，
+	// 它将作为构建认证器的“原料”。
+	klog.V(4).InfoS("Converting command-line options to a structured authenticator config")
 	authenticatorConfig, err := o.ToAuthenticationConfig()
 	if err != nil {
+		klog.ErrorS(err, "Failed to convert to authentication config")
 		return err
 	}
-
+	// 步骤 3: 应用客户端 CA 证书
+	// 这是为了支持基于客户端证书的认证。
+	// 如果配置了 `--client-ca-file`，`ClientCAContentProvider` 就会被设置。
 	if authenticatorConfig.ClientCAContentProvider != nil {
+		klog.V(2).InfoS("Applying client CA certificate for client certificate authentication")
 		if err = authInfo.ApplyClientCert(authenticatorConfig.ClientCAContentProvider, secureServing); err != nil {
 			return fmt.Errorf("unable to load client CA file: %v", err)
 		}
 	}
+	// `RequestHeaderConfig` 也可能需要 CA 证书来验证代理服务器的身份。
 	if authenticatorConfig.RequestHeaderConfig != nil && authenticatorConfig.RequestHeaderConfig.CAContentProvider != nil {
+		klog.V(2).InfoS("Applying client CA certificate for request-header authentication proxy")
 		if err = authInfo.ApplyClientCert(authenticatorConfig.RequestHeaderConfig.CAContentProvider, secureServing); err != nil {
 			return fmt.Errorf("unable to load client CA file: %v", err)
 		}
 	}
-
+	// 步骤 4: 配置 API Audiences 和 Request Header 认证
+	// `RequestHeaderConfig` 用于支持代理认证模式（例如，通过 `X-Remote-User` 等 HTTP Header 识别用户）。
 	authInfo.RequestHeaderConfig = authenticatorConfig.RequestHeaderConfig
+	// `APIAudiences` 用于验证 JWT Token 的 `aud` (audience) 字段。
 	authInfo.APIAudiences = o.APIAudiences
+	// 如果用户配置了 ServiceAccount 发行者但没有指定 API Audiences，则默认使用发行者作为 Audience。
 	if o.ServiceAccounts != nil && len(o.ServiceAccounts.Issuers) != 0 && len(o.APIAudiences) == 0 {
+		klog.V(2).InfoS("No API audiences specified, defaulting to service account issuers")
 		authInfo.APIAudiences = authenticator.Audiences(o.ServiceAccounts.Issuers)
 	}
 
 	// If the optional token getter function is set, use it. Otherwise, use the default token getter.
+	// 步骤 5: 配置 ServiceAccount Token 认证
+	klog.V(2).InfoS("Configuring service account token getter")
+	// `ServiceAccountTokenGetter` 是一个接口，负责根据 Token 字符串获取对应的 ServiceAccount 信息。
 	if o.ServiceAccounts != nil && o.ServiceAccounts.OptionalTokenGetter != nil {
+		// 这是一个钩子，允许在测试等场景下注入自定义的 Token Getter。
 		authenticatorConfig.ServiceAccountTokenGetter = o.ServiceAccounts.OptionalTokenGetter(versionedInformer)
 	} else {
+		// 在生产环境中，使用默认的实现。
 		var nodeLister v1listers.NodeLister
+		// 如果启用了 `ServiceAccountTokenNodeBindingValidation` 特性，需要 NodeLister 来验证 token 是否绑定到特定节点。
 		if utilfeature.DefaultFeatureGate.Enabled(features.ServiceAccountTokenNodeBindingValidation) {
 			nodeLister = versionedInformer.Core().V1().Nodes().Lister()
 		}
-
+		// `NewGetterFromClient` 创建了一个标准的 Token Getter，它会使用 Informer 的缓存来查询 Secret, ServiceAccount, Pod 等资源。
 		authenticatorConfig.ServiceAccountTokenGetter = serviceaccountcontroller.NewGetterFromClient(
 			extclient,
 			versionedInformer.Core().V1().Secrets().Lister(),
@@ -701,15 +732,22 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(
 			nodeLister,
 		)
 	}
-	authenticatorConfig.SecretsWriter = extclient.CoreV1()
 
+	// `SecretsWriter` 用于在需要时创建 ServiceAccount 的 token Secret。
+	authenticatorConfig.SecretsWriter = extclient.CoreV1()
+	// 步骤 6: 配置 Bootstrap Token 认证
+	// Bootstrap Token 是一种临时的、用于简化新节点加入集群过程的认证机制。
 	if authenticatorConfig.BootstrapToken {
+		klog.V(2).InfoS("Configuring bootstrap token authenticator")
 		authenticatorConfig.BootstrapTokenAuthenticator = bootstrap.NewTokenAuthenticator(
+			// 它通过监听 `kube-system` 命名空间下的 Secrets 来工作。
 			versionedInformer.Core().V1().Secrets().Lister().Secrets(metav1.NamespaceSystem),
 		)
 	}
-
+	// 步骤 7: 配置网络出口选择器 (Egress Selector)
+	// 如果配置了网络出口，认证器（如 Webhook 认证）在对外发出请求时会使用这个出口。
 	if egressSelector != nil {
+		klog.V(4).InfoS("Applying egress selector to authenticator config")
 		egressDialer, err := egressSelector.Lookup(egressselector.ControlPlane.AsNetworkContext())
 		if err != nil {
 			return err
@@ -717,33 +755,51 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(
 		authenticatorConfig.CustomDial = egressDialer
 		authenticatorConfig.EgressLookup = egressSelector.Lookup
 	}
-
+	// 步骤 8: 创建最终的认证器链 (The Core of Authentication)
+	klog.InfoS("Creating the authenticator chain...")
+	// `authenticatorConfig.New(ctx)` 是魔法发生的地方。它会根据 `authenticatorConfig` 中的所有配置，
+	// 创建并组装一个认证器链。这个链可能包含：
+	// 1. 客户端证书认证器
+	// 2. ServiceAccount Token 认证器
+	// 3. OIDC Token 认证器
+	// 4. Webhook Token 认证器
+	// 5. ... 等等
+	// 6. 最后通常是匿名认证器
+	// 它还会返回一个 `updateAuthenticationConfig` 函数，用于后续动态重载配置。
+	// 同时，它还生成了需要在 OpenAPI 文档中声明的安全定义。
 	// var openAPIV3SecuritySchemes spec3.SecuritySchemes
 	authenticator, updateAuthenticationConfig, openAPIV2SecurityDefinitions, openAPIV3SecuritySchemes, err := authenticatorConfig.New(ctx)
 	if err != nil {
 		return err
 	}
+	// 将创建好的认证器链赋值给 `authInfo`。
 	authInfo.Authenticator = authenticator
+	klog.InfoS("Authenticator chain created successfully")
 
+	// 步骤 9: 设置动态重载认证配置文件的逻辑
+	// 如果用户通过 `--authentication-config-file` 指定了文件，这里会启动一个后台 goroutine 来监视这个文件的变化。
 	if len(o.AuthenticationConfigFile) > 0 {
+		klog.InfoS("Setting up dynamic reloading for authentication config file", "file", o.AuthenticationConfigFile)
 		authenticationconfigmetrics.RegisterMetrics()
 		authenticationconfigmetrics.RecordAuthenticationConfigLastConfigInfo(apiServerID, authenticatorConfig.AuthenticationConfigData)
 		trackedAuthenticationConfigData := authenticatorConfig.AuthenticationConfigData
 		var mu sync.Mutex
 
 		// ensure anonymous config doesn't change on reload
+		// 确保 `anonymous` 配置在重载时不会被意外改变。
 		originalFileAnonymousConfig := authenticatorConfig.AuthenticationConfig.DeepCopy().Anonymous
 
+		// 启动一个后台 watcher。
 		go filesystem.WatchUntil(
 			ctx,
-			time.Minute,
+			time.Minute, // 每分钟检查一次文件
 			o.AuthenticationConfigFile,
-			func() {
+			func() { // 当文件内容发生变化时，执行此回调函数
 				// TODO collapse onto shared logic with DynamicEncryptionConfigContent controller
 
 				mu.Lock()
 				defer mu.Unlock()
-
+				// 1. 读取新文件内容
 				authConfigBytes, err := os.ReadFile(o.AuthenticationConfigFile)
 				if err != nil {
 					klog.ErrorS(err, "failed to read authentication config file")
@@ -751,13 +807,13 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(
 					// we do not update the tracker here because this error could eventually resolve as we keep retrying
 					return
 				}
-
+				// 2. 检查内容是否真的变了，避免不必要的操作
 				authConfigData := string(authConfigBytes)
 
 				if authConfigData == trackedAuthenticationConfigData {
 					return
 				}
-
+				// 3. 解析新的配置
 				authConfig, err := loadAuthenticationConfigFromData(authConfigBytes)
 				if err != nil {
 					klog.ErrorS(err, "failed to load authentication config")
@@ -766,7 +822,7 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(
 					trackedAuthenticationConfigData = authConfigData
 					return
 				}
-
+				// 4. 验证新的配置是否合法
 				validationErrs := apiservervalidation.ValidateAuthenticationConfiguration(authenticationcel.NewDefaultCompiler(), authConfig, authenticatorConfig.ServiceAccountIssuers)
 				if !reflect.DeepEqual(originalFileAnonymousConfig, authConfig.Anonymous) {
 					validationErrs = append(validationErrs, field.Forbidden(field.NewPath("anonymous"), "changed from initial configuration file"))
@@ -778,7 +834,7 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(
 					trackedAuthenticationConfigData = authConfigData
 					return
 				}
-
+				// 5. 如果一切正常，调用 `updateAuthenticationConfig` 函数，热更新认证器链！
 				timeoutCtx, timeoutCancel := context.WithTimeout(ctx, UpdateAuthenticationConfigTimeout)
 				defer timeoutCancel()
 				if err := updateAuthenticationConfig(timeoutCtx, authConfig); err != nil {
@@ -787,15 +843,18 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(
 					// we do not update the tracker here because this error could eventually resolve as we keep retrying
 					return
 				}
-
+				// 6. 更新跟踪的内容，并记录成功日志和指标。
 				trackedAuthenticationConfigData = authConfigData
+
 				klog.InfoS("reloaded authentication config")
 				authenticationconfigmetrics.RecordAuthenticationConfigAutomaticReloadSuccess(apiServerID, authConfigData)
 			},
 			func(err error) { klog.ErrorS(err, "watching authentication config file") },
 		)
 	}
-
+	// 步骤 10: 更新 OpenAPI 配置
+	// 将认证器链生成的安全定义（如 Bearer Token）添加到 OpenAPI 配置中，
+	// 这样 Swagger UI 等工具就能正确地展示和使用 API 的认证方式。
 	openAPIConfig.SecurityDefinitions = openAPIV2SecurityDefinitions
 	if openAPIV3Config != nil {
 		openAPIV3Config.SecuritySchemes = openAPIV3SecuritySchemes

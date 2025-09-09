@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"k8s.io/klog/v2"
 	"net/http"
 	"time"
 
@@ -112,6 +113,9 @@ type Extra struct {
 // BuildGenericConfig takes the generic controlplane apiserver options and produces
 // the genericapiserver.Config associated with it. The genericapiserver.Config is
 // often shared between multiple delegated apiservers.
+// BuildGenericConfig 函数的作用是: 获取已经“完成”的通用控制平面选项(s)，并生成一个
+// 所有 apiserver 都能共享的 `genericapiserver.Config`。这个函数是构建 apiserver
+// 所有基础功能的核心，包括但不限于：安全、认证、授权、etcd 存储、informer、OpenAPI 等。
 func BuildGenericConfig(
 	s options.CompletedOptions,
 	schemes []*runtime.Scheme,
@@ -123,14 +127,26 @@ func BuildGenericConfig(
 	storageFactory *serverstorage.DefaultStorageFactory,
 	lastErr error,
 ) {
+	// 步骤 1: 创建一个全新的、默认的 genericapiserver.Config
+	// - `legacyscheme.Codecs`: 提供了用于序列化/反序列化 API 对象的编解码器。
+	klog.V(2).InfoS("Creating new generic apiserver config")
 	genericConfig = genericapiserver.NewConfig(legacyscheme.Codecs)
+	// 将 `feature-gates` 配置赋值给 `genericConfig`
 	genericConfig.Flagz = s.Flagz
+	// `MergedResourceConfig` 定义了哪些 API 资源组/版本是启用的。
 	genericConfig.MergedResourceConfig = resourceConfig
-
+	// 步骤 2: 应用最基础的服务运行选项
+	// s.GenericServerRunOptions 包含了像 MaxRequestsInFlight, MinRequestTimeout 等服务器级别的参数。
+	// .ApplyTo 方法将这些参数值应用到 `genericConfig` 中。
+	klog.V(4).InfoS("Applying generic server run options")
 	if lastErr = s.GenericServerRunOptions.ApplyTo(genericConfig); lastErr != nil {
 		return
 	}
-
+	// 步骤 3: 应用安全服务端口配置 (HTTPS)
+	// s.SecureServing 包含了 TLS 证书、端口号等配置。
+	// .ApplyTo 方法会配置 `genericConfig.SecureServing` 和 `genericConfig.LoopbackClientConfig`。
+	// `LoopbackClientConfig` 是 apiserver 用来“自己调用自己”的客户端配置，非常重要。
+	klog.V(4).InfoS("Applying secure serving options")
 	if lastErr = s.SecureServing.ApplyTo(&genericConfig.SecureServing, &genericConfig.LoopbackClientConfig); lastErr != nil {
 		return
 	}
@@ -139,17 +155,26 @@ func BuildGenericConfig(
 	// Since not every generic apiserver has to support protobufs, we
 	// cannot default to it in generic apiserver and need to explicitly
 	// set it in kube-apiserver.
+	// 步骤 4: 优化内部通信 (Loopback Client)
+	// 为了提高效率，apiserver 内部组件之间通信时，强制使用 Protobuf 格式，因为它比 JSON 更高效。
+	// 同时禁用压缩，因为内部通信在高速局域网内，压缩的 CPU 开销得不偿失。
+	klog.V(4).InfoS("Configuring loopback client for internal communication to use protobuf")
 	genericConfig.LoopbackClientConfig.ContentConfig.ContentType = "application/vnd.kubernetes.protobuf"
 	// Disable compression for self-communication, since we are going to be
 	// on a fast local network
 	genericConfig.LoopbackClientConfig.DisableCompression = true
-
+	// 步骤 5: 创建 Informer Factory
+	// Informer 是 Kubernetes 控制器模型的核心，它提供了对 API 对象的高效缓存和事件通知机制。
+	// 这里创建一个 "versioned" informer factory，用于监听所有内置的 API 资源。
+	klog.V(2).InfoS("Creating client and shared informer factory")
 	kubeClientConfig := genericConfig.LoopbackClientConfig
 	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeClientConfig)
 	if err != nil {
 		lastErr = fmt.Errorf("failed to create real external clientset: %w", err)
 		return
 	}
+	// `trim` 函数是一个转换器，用于在对象存入 Informer 缓存之前，去掉 `managedFields` 字段，
+	// 这样可以显著减小内存占用
 	trim := func(obj interface{}) (interface{}, error) {
 		if accessor, err := meta.Accessor(obj); err == nil && accessor.GetManagedFields() != nil {
 			accessor.SetManagedFields(nil)
@@ -157,7 +182,9 @@ func BuildGenericConfig(
 		return obj, nil
 	}
 	versionedInformers = clientgoinformers.NewSharedInformerFactoryWithOptions(clientgoExternalClient, 10*time.Minute, clientgoinformers.WithTransform(trim))
-
+	// 步骤 6: 应用各种特性门控和功能开关
+	klog.V(4).InfoS("Applying feature gates and API enablement options")
+	// Features: 可能是关于 Priority and Fairness (APF) 等高级特性的配置。
 	if lastErr = s.Features.ApplyTo(genericConfig, clientgoExternalClient, versionedInformers); lastErr != nil {
 		return
 	}
@@ -173,21 +200,34 @@ func BuildGenericConfig(
 		}
 	}
 	// wrap the definitions to revert any changes from disabled features
+	// 步骤 7: 配置 OpenAPI (Swagger) 文档生成
+	klog.V(2).InfoS("Configuring OpenAPI v2 and v3 definitions")
+	// 包装 `getOpenAPIDefinitions` 函数，以确保禁用的特性不会出现在 OpenAPI 文档中。
 	getOpenAPIDefinitions = openapi.GetOpenAPIDefinitionsWithoutDisabledFeatures(getOpenAPIDefinitions)
+	// `namer` 负责为 OpenAPI schema 中的定义生成唯一的名称。
 	namer := openapinamer.NewDefinitionNamer(schemes...)
+	// 配置 OpenAPI V2 (旧版 Swagger)
 	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(getOpenAPIDefinitions, namer)
 	genericConfig.OpenAPIConfig.Info.Title = "Kubernetes"
+	// 配置 OpenAPI V3
 	genericConfig.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(getOpenAPIDefinitions, namer)
 	genericConfig.OpenAPIV3Config.Info.Title = "Kubernetes"
-
+	// 步骤 8: 定义长连接请求
+	// 告诉 apiserver 哪些请求是长连接（如 `watch`）或可能长时间运行（如 `exec`, `portforward`），
+	// 以便在请求超时和优雅关闭等处理上对它们进行特殊照顾。
 	genericConfig.LongRunningFunc = filters.BasicLongRunningRequestCheck(
 		sets.NewString("watch", "proxy"),
 		sets.NewString("attach", "exec", "proxy", "log", "portforward"),
 	)
 
+	// 步骤 9: 创建并配置存储工厂 (StorageFactory)
+	// 这是连接到 etcd 的核心。StorageFactory 知道如何为每种资源创建正确的 etcd 存储后端。
+	klog.V(2).InfoS("Creating and configuring storage factory for etcd")
+	// 如果配置了 EgressSelector，将其注入到 etcd 的 transport 中，使得 etcd 客户端的连接也受网络策略控制。
 	if genericConfig.EgressSelector != nil {
 		s.Etcd.StorageConfig.Transport.EgressLookup = genericConfig.EgressSelector.Lookup
 	}
+	// 注入追踪器
 	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) {
 		s.Etcd.StorageConfig.Transport.TracerProvider = genericConfig.TracerProvider
 	} else {
@@ -197,24 +237,32 @@ func BuildGenericConfig(
 	storageFactoryConfig := kubeapiserver.NewStorageFactoryConfigEffectiveVersion(genericConfig.EffectiveVersion)
 	storageFactoryConfig.APIResourceConfig = genericConfig.MergedResourceConfig
 	storageFactoryConfig.DefaultResourceEncoding.SetEffectiveVersion(genericConfig.EffectiveVersion)
+	// `.Complete(s.Etcd)` 将 etcd 的地址、证书等信息填入，`.New()` 创建最终的 factory 实例。
 	storageFactory, lastErr = storageFactoryConfig.Complete(s.Etcd).New()
 	if lastErr != nil {
 		return
 	}
 	// storageFactory.StorageConfig is copied from etcdOptions.StorageConfig,
 	// the StorageObjectCountTracker is still nil. Here we copy from genericConfig.
+	// 将 `StorageObjectCountTracker` 从 genericConfig 拷贝到 storageFactory，用于监控 etcd 中的对象数量。
 	storageFactory.StorageConfig.StorageObjectCountTracker = genericConfig.StorageObjectCountTracker
+	// 将 etcd 的其他配置（如健康检查）应用到 genericConfig。
 	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
 		return
 	}
-
+	// 步骤 10: 配置认证 (Authentication)
+	// s.Authentication 包含了所有认证方式的配置（如 OIDC, ServiceAccount Tokens, Webhook）。
+	// .ApplyTo 会创建并组装一个认证器链。
+	klog.V(2).InfoS("Applying authentication options")
 	ctx := wait.ContextForChannel(genericConfig.DrainedNotify())
 
 	// Authentication.ApplyTo requires already applied OpenAPIConfig and EgressSelector if present
 	if lastErr = s.Authentication.ApplyTo(ctx, &genericConfig.Authentication, genericConfig.SecureServing, genericConfig.EgressSelector, genericConfig.OpenAPIConfig, genericConfig.OpenAPIV3Config, clientgoExternalClient, versionedInformers, genericConfig.APIServerID); lastErr != nil {
 		return
 	}
-
+	// 步骤 11: 配置授权 (Authorization)
+	// `BuildAuthorizer` 会根据用户的配置（如 `--authorization-mode=RBAC,Node`）创建并组合一个授权器链。
+	klog.V(2).InfoS("Building authorizer")
 	var enablesRBAC bool
 	genericConfig.Authorization.Authorizer, genericConfig.RuleResolver, enablesRBAC, err = BuildAuthorizer(
 		ctx,
@@ -227,17 +275,21 @@ func BuildGenericConfig(
 		lastErr = fmt.Errorf("invalid authorization config: %w", err)
 		return
 	}
+	// 如果用户没有启用 RBAC，则禁用 RBAC 相关的 PostStartHook (用于创建默认的集群角色)。
 	if s.Authorization != nil && !enablesRBAC {
 		genericConfig.DisabledPostStartHooks.Insert(rbacrest.PostStartHookName)
 	}
-
+	// 步骤 12: 配置审计 (Audit)
+	// s.Audit 包含了审计日志的策略、输出位置（文件、webhook）等配置。
 	lastErr = s.Audit.ApplyTo(genericConfig)
 	if lastErr != nil {
 		return
 	}
-
+	// 步骤 13: 配置聚合发现管理器
+	// 用于管理 `/apis` 路径下的 API 组发现。
 	genericConfig.AggregatedDiscoveryGroupManager = aggregated.NewResourceManager("apis")
-
+	// 步骤 14: 返回所有创建好的核心组件
+	klog.InfoS("Generic configuration build completed successfully")
 	return
 }
 

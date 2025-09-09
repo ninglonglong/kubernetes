@@ -19,6 +19,7 @@ limitations under the License.
 package informers
 
 import (
+	"k8s.io/klog/v2"
 	reflect "reflect"
 	sync "sync"
 	time "time"
@@ -123,21 +124,60 @@ func NewFilteredSharedInformerFactory(client kubernetes.Interface, defaultResync
 }
 
 // NewSharedInformerFactoryWithOptions constructs a new instance of a SharedInformerFactory with additional options.
+// NewSharedInformerFactoryWithOptions 函数的作用是: 创建一个新的 SharedInformerFactory (共享 Informer 工厂)。
+// 这个工厂是管理和创建所有 Informer 的中心。使用“共享”工厂的好处是，对于同一种资源（例如 Pod），
+// 即使有多个控制器需要监听它，也只会创建一个底层的 Informer 实例，从而节省了与 apiserver 的连接和内存资源。
+//
+// 参数:
+//   - client: 一个实现了 `kubernetes.Interface` 的客户端，用于与 apiserver 通信。
+//   - defaultResync: 一个全局的“重新同步”周期。每隔这个时间，Informer 会将缓存中的所有对象
+//     都重新推送到事件处理函数中，即使对象本身没有变化。这是一种“自愈”机制，可以防止因事件丢失而导致的状态不一致。
+//     通常设置为一个较长的时间（如 10 分钟或更长），或者设置为 0 以禁用。
+//   - options: 一系列可选的配置函数，用于对工厂进行精细化定制。
 func NewSharedInformerFactoryWithOptions(client kubernetes.Interface, defaultResync time.Duration, options ...SharedInformerOption) SharedInformerFactory {
+	// 记录函数入口和核心参数
+	klog.V(4).InfoS("Creating new SharedInformerFactory", "defaultResync", defaultResync, "numOptions", len(options))
+	// 步骤 1: 初始化一个 `sharedInformerFactory` 结构体实例
+	// 这是工厂的内部实现。
 	factory := &sharedInformerFactory{
-		client:           client,
-		namespace:        v1.NamespaceAll,
-		defaultResync:    defaultResync,
-		informers:        make(map[reflect.Type]cache.SharedIndexInformer),
+		// `client`: 用于与 apiserver 通信的客户端，会被所有由该工厂创建的 Informer 共享。
+		client: client,
+		// `namespace`: 默认监听所有命名空间 (`v1.NamespaceAll` 等同于空字符串 "")。
+		// 这个默认值可以通过 `WithNamespace` option 来覆盖。
+		namespace: v1.NamespaceAll,
+		// `defaultResync`: 全局的默认重新同步周期。
+		defaultResync: defaultResync,
+		// `informers`: 这是一个 map，用于缓存已经创建的 Informer 实例。
+		// key 是资源的 Go 类型 (e.g., `reflect.TypeOf(&v1.Pod{})`)，
+		// value 是对应的 `SharedIndexInformer` 实例。
+		// 这样可以确保对同一种资源只创建一个 Informer。
+		informers: make(map[reflect.Type]cache.SharedIndexInformer),
+		// `startedInformers`: 这是一个 map，用于跟踪哪些 Informer 已经启动了。
+		// key 是资源的 Go 类型，value 是一个布尔值。
+		// 工厂的 `Start()` 方法会遍历这个 map 来启动所有 Informer。
 		startedInformers: make(map[reflect.Type]bool),
-		customResync:     make(map[reflect.Type]time.Duration),
+		// `customResync`: 这是一个 map，允许为特定的资源类型设置不同于全局 `defaultResync` 的
+		// 自定义重新同步周期。
+		customResync: make(map[reflect.Type]time.Duration),
 	}
-
+	klog.V(4).InfoS("Initialized sharedInformerFactory struct with default values", "namespace", factory.namespace)
 	// Apply all options
+	// 步骤 2: 应用所有可选配置 (Options Pattern)
+	// 这里使用了函数式选项模式 (Functional Options Pattern)，这是一种非常优雅和可扩展的配置方式。
+	// 每个 `option` 都是一个函数，它接收一个 `*sharedInformerFactory` 指针并返回一个修改后的指针。
+	klog.V(4).InfoS("Applying custom options to the factory")
 	for _, opt := range options {
+		// 依次调用每个选项函数，对 `factory` 进行定制。
+		// 常见的选项有:
+		// - `WithNamespace("my-namespace")`: 让工厂创建的 Informer 只监听 "my-namespace"。
+		// - `WithTweakListOptions(func(*metav1.ListOptions))`: 允许在 List 请求中加入 Label Selector 或 Field Selector。
+		// - `WithTransform(func(interface{}) (interface{}, error))`: 在对象存入缓存前对其进行转换（例如，剥离不必要的字段以节省内存）。
 		factory = opt(factory)
 	}
-
+	// 步骤 3: 返回配置完成的工厂实例
+	// 返回的是一个 `SharedInformerFactory` 接口，外部调用者只能访问接口定义的方法，
+	// 隐藏了内部的 `sharedInformerFactory` 实现细节。
+	klog.V(2).InfoS("SharedInformerFactory created successfully")
 	return factory
 }
 
