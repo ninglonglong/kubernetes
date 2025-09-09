@@ -101,14 +101,26 @@ jobs:
           docker push  $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/kube-scheduler-amd64:${{ env.IMAGE_TAG }}
           echo "Image kube-scheduler pushed successfully!"
           
+          KUBE_BUILD_PLATFORMS=linux/amd64 \
+          KUBE_DOCKER_REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}" \
+          KUBE_FASTBUILD=true \
+          KUBE_BUILD_PARALLEL=1 \
           ./build/release-images.sh kube-controller-manager
           docker push  $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/kube-controller-manager-amd64:${{ env.IMAGE_TAG }}
           echo "Image kube-controller-manager pushed successfully!"
 
+          KUBE_BUILD_PLATFORMS=linux/amd64 \
+          KUBE_DOCKER_REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}" \
+          KUBE_FASTBUILD=true \
+          KUBE_BUILD_PARALLEL=1 \
           ./build/release-images.sh kube-apiserver
           docker push  $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/kube-apiserver-amd64:${{ env.IMAGE_TAG }}
           echo "Image kube-apiserver pushed successfully!"
           
+          KUBE_BUILD_PLATFORMS=linux/amd64 \
+          KUBE_DOCKER_REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}" \
+          KUBE_FASTBUILD=true \
+          KUBE_BUILD_PARALLEL=1 \          
           ./build/release-images.sh kube-proxy
           docker push  $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/kube-proxy-amd64:${{ env.IMAGE_TAG }}
           echo "Image kube-proxy pushed successfully!"
