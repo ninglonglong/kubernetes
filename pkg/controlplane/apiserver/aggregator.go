@@ -49,24 +49,44 @@ import (
 	"k8s.io/kubernetes/pkg/controlplane/controller/crdregistration"
 )
 
+// CreateAggregatorConfig 函数根据主 kube-apiserver 的配置，创建一个专门用于 Aggregator APIServer 的配置。
+// Aggregator APIServer 是一个特殊的 APIServer，它作为 kube-apiserver 的一部分运行，负责处理对外部 API（通过 APIService 注册）的代理请求。
 func CreateAggregatorConfig(
-	kubeAPIServerConfig genericapiserver.Config,
-	commandOptions options.CompletedOptions,
-	externalInformers kubeexternalinformers.SharedInformerFactory,
-	serviceResolver aggregatorapiserver.ServiceResolver,
-	proxyTransport *http.Transport,
-	peerProxy utilpeerproxy.Interface,
-	pluginInitializers []admission.PluginInitializer,
+	kubeAPIServerConfig genericapiserver.Config, // 这是已经构建好的主 kube-apiserver 的通用配置。
+	commandOptions options.CompletedOptions, // 这是从命令行参数解析并补全后的所有选项。
+	externalInformers kubeexternalinformers.SharedInformerFactory, // 外部 Informer 工厂，用于监听 K8s 内置资源（如 Service）。
+	serviceResolver aggregatorapiserver.ServiceResolver, // 服务解析器，用于将 APIService 指向的 Service 解析成可访问的 URL。
+	proxyTransport *http.Transport, // 用于代理请求到后端 APIService 的 HTTP Transport。
+	peerProxy utilpeerproxy.Interface, // 对等代理接口，用于在多个 kube-apiserver 实例之间代理请求（HA 场景）。
+	pluginInitializers []admission.PluginInitializer, // 准入控制插件的初始化器。
 ) (*aggregatorapiserver.Config, error) {
 	// make a shallow copy to let us twiddle a few things
 	// most of the config actually remains the same.  We only need to mess with a couple items related to the particulars of the aggregator
+	// 1. 创建一个 kubeAPIServerConfig 的浅拷贝。
+	// 这么做的目的是为了避免修改原始的 kubeAPIServerConfig，因为原始配置还要用于构建其他 APIServer（如 apiextensions-apiserver）。
+	// 我们只修改 Aggregator APIServer 特需的几个配置项。
 	genericConfig := kubeAPIServerConfig
+	// 2. 清空 PostStartHooks。
+	// PostStartHooks（启动后钩子）是服务器启动后需要执行的任务（如启动 Informer）。
+	// 这些钩子已经在主 kube-apiserver 配置中定义好了，在这里清空是为了防止重复注册和执行，导致冲突。
+	// Aggregator APIServer 通常不需要自己的独立启动后钩子。
 	genericConfig.PostStartHooks = map[string]genericapiserver.PostStartHookConfigEntry{}
+	// 3. 清空 RESTOptionsGetter。
+	// 这个 Getter 用于获取 etcd 的存储选项。Aggregator APIServer 会有自己专门的 etcd 存储配置，
+	// 所以这里设为 nil，稍后会用自己的方式重新配置。
 	genericConfig.RESTOptionsGetter = nil
 	// prevent generic API server from installing the OpenAPI handler. Aggregator server
 	// has its own customized OpenAPI handler.
-	genericConfig.SkipOpenAPIInstallation = true
 
+	// 4. 禁止安装默认的 OpenAPI Handler。
+	// OpenAPI 提供了 API 的规范文档（类似 Swagger）。
+	// Aggregator APIServer 需要一个定制化的 OpenAPI Handler，它不仅要展示自己的 API (apiregistration.k8s.io)，
+	// 还要能够聚合所有通过它代理的外部 APIService 的 OpenAPI 文档。
+	// 因此，我们跳过通用服务器的默认安装，后续 Aggregator 自己会安装定制版。
+	genericConfig.SkipOpenAPIInstallation = true
+	// 5. [特性门控] 如果启用了 StorageVersionAPI 和 APIServerIdentity 特性，则添加一个特殊的处理器。
+	// 这个处理器（StorageVersionPrecondition）会拦截对内置资源的写请求，
+	// 确保在执行写操作前，目标资源的存储版本已经更新到最新，这是为了保证数据迁移和版本升级的安全性。
 	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.StorageVersionAPI) &&
 		utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerIdentity) {
 		// Add StorageVersionPrecondition handler to aggregator-apiserver.
@@ -74,13 +94,18 @@ func CreateAggregatorConfig(
 		// target resources' storage versions are up-to-date.
 		genericConfig.BuildHandlerChainFunc = genericapiserver.BuildHandlerChainWithStorageVersionPrecondition
 	}
-
+	// 6. [HA 场景] 如果配置了对等代理（peerProxy），则将其包装到处理器链中。
+	// 在高可用（HA）部署中，有多个 kube-apiserver 实例。当一个 apiserver 收到需要访问 etcd 的请求时，
+	// 它可能会将请求代理到另一个 apiserver 实例来处理，以保证数据一致性（特别是对于 watch 请求）。
+	// `peerProxy.WrapHandler` 就是将这个代理逻辑包装在核心 API Handler 之外。
 	if peerProxy != nil {
 		originalHandlerChainBuilder := genericConfig.BuildHandlerChainFunc
 		genericConfig.BuildHandlerChainFunc = func(apiHandler http.Handler, c *genericapiserver.Config) http.Handler {
 			// Add peer proxy handler to aggregator-apiserver.
 			// wrap the peer proxy handler first.
+			// 将 peerProxy handler 包装在最内层，紧邻核心的 apiHandler。
 			apiHandler = peerProxy.WrapHandler(apiHandler)
+			// 然后调用原始的处理器链构建函数，将认证、授权等其他中间件包装在更外层。
 			return originalHandlerChainBuilder(apiHandler, c)
 		}
 	}
@@ -88,14 +113,28 @@ func CreateAggregatorConfig(
 	// copy the etcd options so we don't mutate originals.
 	// we assume that the etcd options have been completed already.  avoid messing with anything outside
 	// of changes to StorageConfig as that may lead to unexpected behavior when the options are applied.
+	// 7. 配置 etcd 存储选项。
+	// Aggregator APIServer 需要在 etcd 中存储 `APIService` 这种资源对象。
+	// 这里复制一份命令行传入的 etcd 选项，然后进行定制。
 	etcdOptions := *commandOptions.Etcd
+	// 7a. 设置存储的编解码器（Codec）。
+	// 指定 Aggregator APIServer 管理的资源（`apiregistration.k8s.io`组下的资源）在 etcd 中存储时
+	// 使用哪个版本的 schema 进行编码。这里支持 v1 和 v1beta1 两个版本。
 	etcdOptions.StorageConfig.Codec = aggregatorscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion, v1beta1.SchemeGroupVersion)
+	// 7b. 设置编码版本控制器（EncodeVersioner）。
+	// 当需要写入 etcd 时，这个版本控制器决定应该使用哪个版本的 schema 进行编码。
 	etcdOptions.StorageConfig.EncodeVersioner = runtime.NewMultiGroupVersioner(v1.SchemeGroupVersion, schema.GroupKind{Group: v1beta1.GroupName})
+	// 7c. 跳过健康检查端点。
+	// 主 kube-apiserver 已经注册了对 etcd 的健康检查。这里设为 true 是为了避免 Aggregator APIServer 重复注册，导致端口冲突或日志混乱。
 	etcdOptions.SkipHealthEndpoints = true // avoid double wiring of health checks
+	// 7d. 将定制好的 etcd 选项应用到通用配置中。
 	if err := etcdOptions.ApplyTo(&genericConfig); err != nil {
 		return nil, err
 	}
-
+	// 8. 配置 API 启用/禁用选项。
+	// `APIEnablement` 选项决定了哪些 API 组/版本是开启的。
+	// 这里使用 Aggregator 的默认资源配置（`DefaultAPIResourceConfigSource`）和它的 Scheme（包含了 APIService 资源的定义）
+	// 来告诉通用服务器，它需要为 `apiregistration.k8s.io` 这个 API 组提供服务。
 	// override MergedResourceConfig with aggregator defaults and registry
 	if err := commandOptions.APIEnablement.ApplyTo(
 		&genericConfig,
@@ -103,22 +142,29 @@ func CreateAggregatorConfig(
 		aggregatorscheme.Scheme); err != nil {
 		return nil, err
 	}
-
+	// 9. 构建最终的 Aggregator APIServer 配置对象。
 	aggregatorConfig := &aggregatorapiserver.Config{
+		// 9a. 通用配置部分。
+		// 将我们上面精心修改过的 `genericConfig` 包装进 `RecommendedConfig` 中。
+		// `RecommendedConfig` 包含了一些推荐的默认设置，如共享 Informer 工厂。
 		GenericConfig: &genericapiserver.RecommendedConfig{
 			Config:                genericConfig,
 			SharedInformerFactory: externalInformers,
 		},
+		// 9b. 额外配置部分。
+		// 这些是 Aggregator APIServer 特有的配置项，不属于通用服务器的范畴。
 		ExtraConfig: aggregatorapiserver.ExtraConfig{
-			ProxyClientCertFile:       commandOptions.ProxyClientCertFile,
-			ProxyClientKeyFile:        commandOptions.ProxyClientKeyFile,
-			PeerAdvertiseAddress:      commandOptions.PeerAdvertiseAddress,
-			ServiceResolver:           serviceResolver,
-			ProxyTransport:            proxyTransport,
-			RejectForwardingRedirects: commandOptions.AggregatorRejectForwardingRedirects,
+			ProxyClientCertFile:       commandOptions.ProxyClientCertFile,                 // 代理客户端证书文件路径，用于 apiserver 连接扩展 apiserver。
+			ProxyClientKeyFile:        commandOptions.ProxyClientKeyFile,                  // 代理客户端私钥文件路径。
+			PeerAdvertiseAddress:      commandOptions.PeerAdvertiseAddress,                // [HA场景] 向其他对等 apiserver 宣告的地址。
+			ServiceResolver:           serviceResolver,                                    // 前面传入的服务解析器。
+			ProxyTransport:            proxyTransport,                                     // 前面传入的 HTTP Transport。
+			RejectForwardingRedirects: commandOptions.AggregatorRejectForwardingRedirects, // 是否拒绝来自后端 APIService 的转发重定向。
 		},
 	}
-
+	// 10. 再次清空 PostStartHooks（这是一个防御性编程/历史遗留问题）。
+	// 虽然前面已经清空过一次，但 `RecommendedConfig` 的创建过程可能会引入一些默认的钩子。
+	// 这里再次清空，确保最终的配置对象中绝对没有多余的钩子，防止启动失败。
 	// we need to clear the poststarthooks so we don't add them multiple times to all the servers (that fails)
 	aggregatorConfig.GenericConfig.PostStartHooks = map[string]genericapiserver.PostStartHookConfigEntry{}
 

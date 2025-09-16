@@ -118,37 +118,37 @@ func registerAllAdmissionPluginFlags(fs *pflag.FlagSet) {
 // RegisterAllAdmissionPlugins registers all admission plugins.
 // The order of registration is irrelevant, see AllOrderedPlugins for execution order.
 func RegisterAllAdmissionPlugins(plugins *admission.Plugins) {
-	admit.Register(plugins) // DEPRECATED as no real meaning
-	alwayspullimages.Register(plugins)
-	antiaffinity.Register(plugins)
-	defaulttolerationseconds.Register(plugins)
-	defaultingressclass.Register(plugins)
-	denyserviceexternalips.Register(plugins)
-	deny.Register(plugins) // DEPRECATED as no real meaning
-	eventratelimit.Register(plugins)
-	extendedresourcetoleration.Register(plugins)
-	gc.Register(plugins)
-	imagepolicy.Register(plugins)
-	limitranger.Register(plugins)
-	autoprovision.Register(plugins)
-	exists.Register(plugins)
-	noderestriction.Register(plugins)
-	nodetaint.Register(plugins)
-	podnodeselector.Register(plugins)
-	podtolerationrestriction.Register(plugins)
-	runtimeclass.Register(plugins)
-	resourcequota.Register(plugins)
-	podsecurity.Register(plugins)
-	podpriority.Register(plugins)
-	serviceaccount.Register(plugins)
-	setdefault.Register(plugins)
-	resize.Register(plugins)
-	storageobjectinuseprotection.Register(plugins)
-	certapproval.Register(plugins)
-	certsigning.Register(plugins)
-	ctbattest.Register(plugins)
-	certsubjectrestriction.Register(plugins)
-	podtopologylabels.Register(plugins)
+	admit.Register(plugins)                        // DEPRECATED as no real meaning	// DEPRECATED: 一个总是允许所有请求的插件，用于测试，已无实际意义。
+	alwayspullimages.Register(plugins)             // 强制将 Pod 的镜像拉取策略（imagePullPolicy）设置为 "Always"。
+	antiaffinity.Register(plugins)                 // 实现旧版的 Pod 反亲和性注解（现在推荐使用 PodSpec 中的 affinity 字段）。
+	defaulttolerationseconds.Register(plugins)     // 为 Pod 上 "not-ready" 和 "unreachable" 的容忍度（Toleration）设置默认的容忍时间（tolerationSeconds）。
+	defaultingressclass.Register(plugins)          // 为没有指定 IngressClass 的 Ingress 对象设置一个默认的 IngressClass。
+	denyserviceexternalips.Register(plugins)       // 拒绝在 Service 中使用 ExternalIPs 字段，这是一个安全特性。
+	deny.Register(plugins)                         // DEPRECATED as no real meaning
+	eventratelimit.Register(plugins)               // 限制用户可以产生的事件（Event）数量，防止事件泛滥。
+	extendedresourcetoleration.Register(plugins)   // 自动为使用扩展资源（如 GPU）的 Pod 添加相应的容忍度。
+	gc.Register(plugins)                           // 为新创建的对象设置 OwnerReference 的初始状态，以便垃圾回收控制器（Garbage Collector）能正确工作。
+	imagepolicy.Register(plugins)                  // [已废弃] 基于外部 Webhook 策略来决定是否允许使用某个容器镜像。
+	limitranger.Register(plugins)                  // [核心资源插件] 强制 Pod 和容器的资源请求（requests）和限制（limits），并可为命名空间中的对象设置默认值。
+	autoprovision.Register(plugins)                // 自动创建不存在的命名空间（默认关闭）。
+	exists.Register(plugins)                       // 确保所有需要命名空间的对象都被创建在已经存在的命名空间中。
+	noderestriction.Register(plugins)              // [核心安全插件] 限制 kubelet 只能修改其自身所在的 Node 对象和其上的 Pod 对象。
+	nodetaint.Register(plugins)                    // 在旧版本中用于 Taint-based evictions，现在主要由 `TaintNodesByCondition` 替代。
+	podnodeselector.Register(plugins)              // 强制 Pod 遵守其所在命名空间中定义的节点选择器（NodeSelector）。
+	podtolerationrestriction.Register(plugins)     // 限制 Pod 可以拥有的容忍度，以匹配其所在命名空间中定义的白名单。
+	runtimeclass.Register(plugins)                 // 根据 RuntimeClass 的定义来处理 Pod 的调度等属性。
+	resourcequota.Register(plugins)                // [核心配额插件] 检查进入的请求是否会超出命名空间中定义的资源配额（ResourceQuota）。
+	podsecurity.Register(plugins)                  // [核心安全插件] Pod 安全标准（Pod Security Standards）的实现，替代了 PodSecurityPolicy。
+	podpriority.Register(plugins)                  // [核心调度插件] 根据 PriorityClass 为 Pod 设置优先级，并阻止低优先级 Pod 抢占高优先级 Pod。
+	serviceaccount.Register(plugins)               // [核心插件] 实现 ServiceAccount 的自动化，如为 Pod 自动挂载 ServiceAccount token。
+	setdefault.Register(plugins)                   // 为 API 对象设置各种默认值，是一个通用的默认值填充插件。
+	resize.Register(plugins)                       // 允许在线扩容 PVC。
+	storageobjectinuseprotection.Register(plugins) // [核心保护插件] 防止正在被 Pod 使用的 PV 和 PVC 被意外删除。
+	certapproval.Register(plugins)                 // 处理 CertificateSigningRequest (CSR) 的批准逻辑。
+	certsigning.Register(plugins)                  // 处理 CSR 的签发逻辑。
+	ctbattest.Register(plugins)                    // 用于证书透明度（Certificate Transparency）的证明。
+	certsubjectrestriction.Register(plugins)       // 限制 CSR 中允许的主题（Subject）字段。
+	podtopologylabels.Register(plugins)            // 根据节点拓扑信息，自动为 PVC（PersistentVolumeClaim）添加或验证标签。
 }
 
 // DefaultOffAdmissionPlugins get admission plugins off by default for kube-apiserver.

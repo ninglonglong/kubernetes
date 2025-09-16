@@ -863,6 +863,8 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(
 }
 
 // ApplyAuthorization will conditionally modify the authentication options based on the authorization options
+// ApplyAuthorization 会根据授权（Authorization）选项，有条件地修改认证（Authentication）选项。
+// 这个函数体现了认证和授权两个环节之间的联动和制约关系。
 func (o *BuiltInAuthenticationOptions) ApplyAuthorization(authorization *BuiltInAuthorizationOptions) {
 	if o == nil || authorization == nil || o.Anonymous == nil {
 		return
@@ -870,6 +872,22 @@ func (o *BuiltInAuthenticationOptions) ApplyAuthorization(authorization *BuiltIn
 
 	// authorization ModeAlwaysAllow cannot be combined with AnonymousAuth.
 	// in such a case the AnonymousAuth is stomped to false and you get a message
+	// --- 核心安全逻辑 ---
+
+	// 这个 if 语句检查是否出现了一种“致命”的不安全组合：
+	//
+	// `o.Anonymous.Allow`: 检查【认证】环节是否启用了“匿名认证”。
+	//                    如果为 true，意味着任何无法被其他认证方式识别的请求，
+	//                    都会被系统赋予一个特殊的匿名用户身份（system:anonymous）。
+	//
+	// `sets.NewString(authorization.Modes...).Has(authzmodes.ModeAlwaysAllow)`:
+	//                    检查【授权】环节是否启用了“总是允许”模式。
+	//                    如果为 true，意味着无论什么用户（包括匿名用户）发来什么请求，
+	//                    授权系统都会无条件地允许。
+	//
+	// 如果这两个条件【同时】为 true，就意味着：
+	// “任何一个路人甲（匿名用户）都可以对集群做任何事（总是允许）”。
+	// 这是一个巨大的安全漏洞，必须被阻止。
 	if o.Anonymous.Allow && sets.NewString(authorization.Modes...).Has(authzmodes.ModeAlwaysAllow) {
 		klog.Warningf("AnonymousAuth is not allowed with the AlwaysAllow authorizer. Resetting AnonymousAuth to false. You should use a different authorizer")
 		o.Anonymous.Allow = false

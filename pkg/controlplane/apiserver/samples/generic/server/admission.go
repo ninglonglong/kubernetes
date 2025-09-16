@@ -35,6 +35,7 @@ import (
 
 // DefaultOffAdmissionPlugins get admission plugins off by default for kube-apiserver.
 func DefaultOffAdmissionPlugins() sets.Set[string] {
+	// 默认开启
 	defaultOnPlugins := sets.New[string](
 		lifecycle.PluginName,                 // NamespaceLifecycle
 		serviceaccount.PluginName,            // ServiceAccount

@@ -83,17 +83,45 @@ type AdmissionOptions struct {
 //	Provides the list of RecommendedPluginOrder that holds sane values
 //	that can be used by servers that don't care about admission chain.
 //	Servers that do care can overwrite/append that field after creation.
+//
+// NewAdmissionOptions 创建一个新的 AdmissionOptions 实例。
+//
+// 注意：
+//  1. 除了创建对象，它还会调用 RegisterAllAdmissionPlugins 来注册所有“通用”的准入插件。
+//  2. 它提供了 RecommendedPluginOrder 字段，其中包含了一组合理的默认值，
+//     不关心准入链顺序的服务器可以直接使用。
+//     而关心顺序的服务器可以在创建此对象后，覆盖或追加该字段的内容。
 func NewAdmissionOptions() *AdmissionOptions {
+	// 直接创建一个 AdmissionOptions 结构体实例，并填充所有字段的默认值。
 	options := &AdmissionOptions{
-		Plugins:    admission.NewPlugins(),
+		// Plugins: 初始化一个空的插件注册表。
+		Plugins: admission.NewPlugins(),
+		// Decorators: 设置一个默认的装饰器。
+		// 这个装饰器 `admissionmetrics.WithControllerMetrics` 会包装每个准-入插件，
+		// 使得每个插件的执行延迟、错误率等指标都能被自动收集和暴露到 /metrics 端点。
+		// 这是实现可观测性的关键一步。
 		Decorators: admission.Decorators{admission.DecoratorFunc(admissionmetrics.WithControllerMetrics)},
 		// This list is mix of mutating admission plugins and validating
 		// admission plugins. The apiserver always runs the validating ones
 		// after all the mutating ones, so their relative order in this list
 		// doesn't matter.
-		RecommendedPluginOrder: []string{lifecycle.PluginName, mutatingadmissionpolicy.PluginName, mutatingwebhook.PluginName, validatingadmissionpolicy.PluginName, validatingwebhook.PluginName},
-		DefaultOffPlugins:      sets.Set[string]{},
+		// RecommendedPluginOrder: 提供一个最基础、最通用的插件执行顺序。
+		// 这个列表混合了修改型（mutating）和验证型（validating）插件。
+		// API 服务器的核心逻辑会自动保证所有的修改型插件都在验证型插件之前执行，
+		// 所以它们在这个列表中的相对顺序并不重要。
+		RecommendedPluginOrder: []string{lifecycle.PluginName, // "PodLifecycle" (旧称，现在可能有所变化)，处理 Pod 的生命周期，如终止等。
+			mutatingadmissionpolicy.PluginName,   // "MutatingAdmissionPolicy"，处理 CEL 表达式定义的修改策略。
+			mutatingwebhook.PluginName,           // "MutatingAdmissionWebhook"，调用外部 Webhook 来修改对象。
+			validatingadmissionpolicy.PluginName, // "ValidatingAdmissionPolicy"，处理 CEL 表达式定义的验证策略。
+			validatingwebhook.PluginName},        // "ValidatingAdmissionWebhook"，调用外部 Webhook 来验证对象。
+		// DefaultOffPlugins: 默认情况下，通用 API 服务器没有需要默认关闭的插件。
+		// 这个列表为空，意味着所有注册的插件默认都是“开启”状态，除非用户明确禁用。
+		DefaultOffPlugins: sets.Set[string]{},
 	}
+	// 注册所有“通用”的准入插件。
+	// 注意：这里的 `server.RegisterAllAdmissionPlugins` 和 kube-apiserver 中的那个函数不同。
+	// 它只注册那些不依赖于 Kubernetes 核心 API (即不依赖于 `k8s.io/kubernetes` 包) 的通用插件。
+	// 例如，它会注册 `MutatingAdmissionWebhook` 和 `ValidatingAdmissionWebhook`，但不会注册 `LimitRanger` 或 `ResourceQuota`。
 	server.RegisterAllAdmissionPlugins(options.Plugins)
 	return options
 }

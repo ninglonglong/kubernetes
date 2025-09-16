@@ -84,14 +84,34 @@ func NewBuiltInAuthorizationOptions() *BuiltInAuthorizationOptions {
 }
 
 // Complete modifies authorization options
+// Complete 修改授权选项，为其填充默认值。
+
 func (o *BuiltInAuthorizationOptions) Complete() []error {
+	// 防御性编程：如果选项对象本身是 nil，则直接返回，什么也不做。
+
 	if o == nil {
 		return nil
 	}
 
+	// 这是整个函数的核心逻辑：检查用户是否配置了任何授权模式。
+	//
+	// `len(o.AuthorizationConfigurationFile) == 0`: 检查用户是否提供了授权配置文件。
+	//                                              在现代版本中，这主要用于 Webhook 模式。
+	// `len(o.Modes) == 0`: 检查用户是否通过 `--authorization-mode` 参数指定了任何授权模式。
+	//
+	// 如果两个条件【同时】成立，意味着用户完全没有配置任何授权机制。
 	if len(o.AuthorizationConfigurationFile) == 0 && len(o.Modes) == 0 {
+		// 在这种“零配置”的情况下，为了让服务器能够启动并响应请求（尤其是在测试或极简环境中），
+		// 系统会默认启用 "AlwaysAllow" 模式。
+		//
+		// `authzmodes.ModeAlwaysAllow` 的值就是 "AlwaysAllow"。
+		// 这个授权模式会对所有请求都说“是”，即允许所有操作。
+		//
+		// 警告：这在生产环境中是极其不安全的！
 		o.Modes = []string{authzmodes.ModeAlwaysAllow}
 	}
+	// 如果用户配置了任何一种授权模式（例如 `--authorization-mode=RBAC`），
+	// `if` 条件就不会满足，此函数将什么也不做，完全尊重用户的配置。
 	return nil
 }
 

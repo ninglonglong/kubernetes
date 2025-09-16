@@ -239,11 +239,17 @@ func equalToAcceptedOrFresh(requestedName, acceptedName string, usedNames sets.S
 	return fmt.Errorf("%q is already in use", requestedName)
 }
 
+// sync 是控制器的核心协调函数。它接收一个工作项的 key，通常是 "namespace/name" 或 "name"（对于集群级资源）。
 func (c *NamingConditionController) sync(key string) error {
+	// --- 1. 从本地缓存获取最新的 CRD 对象 ---
+	// `c.crdLister.Get(key)` 从 Informer 的本地缓存中获取 CRD 对象。这非常快，不会访问 API Server。
 	inCustomResourceDefinition, err := c.crdLister.Get(key)
 	if apierrors.IsNotFound(err) {
 		// CRD was deleted and has freed its names.
 		// Reconsider all other CRDs in the same group.
+		// 如果在缓存中找不到，说明这个 CRD 已经被删除了。
+		// 一个 CRD 被删除后，它之前占用的名称就被释放了。这可能会让同组中其他之前因冲突而失败的 CRD 有机会成功。
+		// 所以，我们需要重新检查该组中的所有其他 CRD。
 		if err := c.requeueAllOtherGroupCRDs(key); err != nil {
 			return err
 		}
@@ -252,28 +258,48 @@ func (c *NamingConditionController) sync(key string) error {
 	if err != nil {
 		return err
 	}
-
+	// --- 2. 快速路径优化：检查是否需要处理 ---
+	// 如果 .spec.names (用户期望的名称) 和 .status.acceptedNames (系统已接受的名称) 完全相同，
+	// 说明这个 CRD 的名称已经稳定，并且没有新的变更请求，我们无需做任何事情。
+	// 这是一种常见的优化，可以避免不必要的计算和 API 调用。
 	// Skip checking names if Spec and Status names are same.
 	if equality.Semantic.DeepEqual(inCustomResourceDefinition.Spec.Names, inCustomResourceDefinition.Status.AcceptedNames) {
 		return nil
 	}
-
+	// --- 3. 核心计算逻辑 ---
+	// 调用 `calculateNamesAndConditions` 来执行实际的名称冲突检查。
+	// 这个函数会查看集群中所有其他的 CRD，判断当前 CRD 的 `.spec.names` 是否可用。
+	// 它返回：
+	// - `acceptedNames`: 最终被系统接受的名称。如果无冲突，它等于 `.spec.names`；否则可能是空的。
+	// - `namingCondition`: 一个描述名称是否被接受的 Condition 对象 (`NamesAccepted: True/False`)。
+	// - `establishedCondition`: 一个描述 CRD 是否已建立的 Condition 对象。
 	acceptedNames, namingCondition, establishedCondition := c.calculateNamesAndConditions(inCustomResourceDefinition)
-
+	// --- 4. 再次优化：检查状态是否真的改变 ---
+	// 比较计算出的新状态 (`acceptedNames`, `namingCondition`) 和 CRD 当前的状态。
+	// 如果没有任何变化，我们也不需要执行更新操作。
 	// nothing to do if accepted names and NamesAccepted condition didn't change
 	if reflect.DeepEqual(inCustomResourceDefinition.Status.AcceptedNames, acceptedNames) &&
 		apiextensionshelpers.IsCRDConditionEquivalent(&namingCondition, apiextensionshelpers.FindCRDCondition(inCustomResourceDefinition, apiextensionsv1.NamesAccepted)) {
 		return nil
 	}
+	// --- 5. 更新 CRD 状态 ---
+	// 如果状态确实发生了变化，就需要通过 API Server 更新 CRD 的 `.status` 字段。
 
+	// 创建一个 CRD 对象的深拷贝，因为我们不能直接修改从缓存中获取的对象。
 	crd := inCustomResourceDefinition.DeepCopy()
+	// 将新计算出的状态应用到这个深拷贝对象上。
 	crd.Status.AcceptedNames = acceptedNames
 	apiextensionshelpers.SetCRDCondition(crd, namingCondition)
 	apiextensionshelpers.SetCRDCondition(crd, establishedCondition)
-
+	// 调用 `crdClient` 的 `UpdateStatus` 方法，将变更提交到 API Server。
+	// 注意：只更新 `.status` 子资源，而不是整个 CRD 对象。这是最佳实践。
 	updatedObj, err := c.crdClient.CustomResourceDefinitions().UpdateStatus(context.TODO(), crd, metav1.UpdateOptions{})
 	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 		// deleted or changed in the meantime, we'll get called again
+		// 如果返回 NotFound 或 Conflict 错误：
+		// - NotFound: CRD 在我们计算和更新的间隙被删除了。
+		// - Conflict: 在我们更新的间隙，有其他人也更新了这个 CRD，导致我们的版本过时了。
+		// 这两种情况都是正常的，Informer 会再次把这个 CRD 的变更事件发给我们，所以我们什么都不用做，直接返回 nil。
 		return nil
 	}
 	if err != nil {
@@ -281,11 +307,20 @@ func (c *NamingConditionController) sync(key string) error {
 	}
 
 	// if the update was successful, go ahead and add the entry to the mutation cache
+	// --- 6. 更新本地缓存和触发后续检查 ---
+	// 如果 `UpdateStatus` 调用成功，API Server 会返回更新后的对象 `updatedObj`。
+	// 将这个最新的对象更新到 `c.crdMutationCache` 中。这是一个本地的、写操作的缓存，
+	// 用于防止控制器因读到旧的缓存（Informer 的缓存有延迟）而做出错误判断。
 	c.crdMutationCache.Mutation(updatedObj)
 
 	// we updated our status, so we may be releasing a name.  When this happens, we need to rekick everything in our group
 	// if we fail to rekick, just return as normal.  We'll get everything on a resync
+	// 因为我们刚刚更新了一个 CRD 的状态，这可能意味着它释放了一个之前占用的名称，
+	// 或者占用了新的名称。这可能会影响到同组中的其他 CRD。
+	// 因此，再次触发对同组中所有其他 CRD 的重新检查。
 	if err := c.requeueAllOtherGroupCRDs(key); err != nil {
+		// 如果触发失败，也不算致命错误，因为定期的 resync 最终会修正所有状态。
+
 		return err
 	}
 

@@ -110,32 +110,70 @@ type ServerRunOptions struct {
 	RuntimeConfigEmulationForwardCompatible bool
 }
 
+// NewServerRunOptions 创建一个新的 ServerRunOptions 对象。
+// 这个函数是一个简化的构造函数，它在内部处理了组件版本和特性门控的全局注册，
+// 然后委托给一个更具体的构造函数来完成实际的创建工作。
 func NewServerRunOptions() *ServerRunOptions {
+	// 这个 if 语句是一个关键的“初始化一次”逻辑。
+	// 它检查“默认Kube组件”的版本信息是否已经在全局注册表中注册过。
+	// 如果 EffectiveVersionFor 返回 nil，意味着尚未注册，就需要执行注册操作。
+	// 这样做可以确保在同一个进程中，无论这个函数被调用多少次，注册操作都只执行一次，避免了竞态条件。
 	if compatibility.DefaultComponentGlobalsRegistry.EffectiveVersionFor(basecompatibility.DefaultKubeComponent) == nil {
+		// 获取默认的可变特性门控集合。这是一个全局变量，包含了所有已知的特性开关。
 		featureGate := utilfeature.DefaultMutableFeatureGate
+		// 获取在编译时确定的组件“有效版本”。这个版本信息通常来自 Git 标签，
+		// 它决定了组件在兼容性方面的行为表现。
 		effectiveVersion := compatibility.DefaultBuildEffectiveVersion()
+		// 必须成功地将组件、其有效版本和特性门控注册到全局注册表中。
+		// 如果注册失败（例如，因为重复注册），utilruntime.Must 会导致程序 panic，
+		// 因为这是一个启动时的关键设置，失败意味着程序无法正常运行。
 		utilruntime.Must(compatibility.DefaultComponentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, effectiveVersion, featureGate))
 	}
-
+	// 在确保全局信息已注册后，调用一个更具体的构造函数来创建 ServerRunOptions。
+	// 它传递了组件标识符和全局注册表，以便 ServerRunOptions 知道自己属于哪个组件，
+	// 并能从中查询版本和特性信息。
 	return NewServerRunOptionsForComponent(basecompatibility.DefaultKubeComponent, compatibility.DefaultComponentGlobalsRegistry)
 }
 
+// NewServerRunOptionsForComponent 是一个构造函数，它为一个特定的组件创建 ServerRunOptions，并填充了一组推荐的默认值。
+// componentName: 当前组件的名称，例如 "kube-apiserver" 或 "kube-scheduler"。
+// componentGlobalsRegistry: 一个全局注册表，包含了组件的版本和特性门控信息。
 func NewServerRunOptionsForComponent(componentName string, componentGlobalsRegistry basecompatibility.ComponentGlobalsRegistry) *ServerRunOptions {
+	// NewServerRunOptionsForComponent 是一个构造函数，它为一个特定的组件创建 ServerRunOptions，并填充了一组推荐的默认值。
+	// componentName: 当前组件的名称，例如 "kube-apiserver" 或 "kube-scheduler"。
+	// componentGlobalsRegistry: 一个全局注册表，包含了组件的版本和特性门控信息。
 	defaults := server.NewConfig(serializer.CodecFactory{})
+	// 返回一个新的 ServerRunOptions 结构体指针。
+	// 结构体的字段被初始化为从 'defaults' 对象中获取的推荐值。
 	return &ServerRunOptions{
-		MaxRequestsInFlight:                 defaults.MaxRequestsInFlight,
-		MaxMutatingRequestsInFlight:         defaults.MaxMutatingRequestsInFlight,
-		RequestTimeout:                      defaults.RequestTimeout,
-		LivezGracePeriod:                    defaults.LivezGracePeriod,
-		MinRequestTimeout:                   defaults.MinRequestTimeout,
-		StorageInitializationTimeout:        defaults.StorageInitializationTimeout,
-		ShutdownDelayDuration:               defaults.ShutdownDelayDuration,
+		// 服务器可以同时处理的最大非变更性请求数。默认为 400。
+		MaxRequestsInFlight: defaults.MaxRequestsInFlight,
+		// 服务器可以同时处理的最大变更性请求数（如创建、更新、删除）。默认为 200。
+		MaxMutatingRequestsInFlight: defaults.MaxMutatingRequestsInFlight,
+		// 单个请求的默认超时时间。默认为 60 秒。
+		RequestTimeout: defaults.RequestTimeout,
+		// /livez 健康检查在启动时的宽限期。默认为 0，表示没有宽限期。
+		LivezGracePeriod: defaults.LivezGracePeriod,
+		// 用户可以通过请求参数指定的最小超时时间（秒）。默认为 1800 秒（30分钟）。
+		MinRequestTimeout: defaults.MinRequestTimeout,
+		// 存储层（etcd）初始化的超时时间。默认为 1 分钟。
+		StorageInitializationTimeout: defaults.StorageInitializationTimeout,
+		// 优雅关闭前的延迟时间。默认为 0。对于 kube-apiserver，这个值通常会被覆盖为一个非零值（如 1 秒）。
+		ShutdownDelayDuration: defaults.ShutdownDelayDuration,
+		// 在优雅关闭期间，为终止 watch 请求留出的宽限时间。默认为 0。
 		ShutdownWatchTerminationGracePeriod: defaults.ShutdownWatchTerminationGracePeriod,
-		JSONPatchMaxCopyBytes:               defaults.JSONPatchMaxCopyBytes,
-		MaxRequestBodyBytes:                 defaults.MaxRequestBodyBytes,
-		ShutdownSendRetryAfter:              false,
-		ComponentName:                       componentName,
-		ComponentGlobalsRegistry:            componentGlobalsRegistry,
+		// 处理 JSON Patch 请求时允许复制的最大字节数。默认为 32 KB。
+		JSONPatchMaxCopyBytes: defaults.JSONPatchMaxCopyBytes,
+		// 请求体的最大字节数。默认为 3 MB。
+		MaxRequestBodyBytes: defaults.MaxRequestBodyBytes,
+		// 在关闭期间，是否发送 "Retry-After" HTTP 响应头。默认为 false。、
+		ShutdownSendRetryAfter: false,
+		// 记录下当前组件的名称。这个名称将在日志和指标中用作标识。
+		ComponentName: componentName,
+		// 保存对全局注册表的引用。这样，在后续的配置过程中，
+		// ServerRunOptions 就可以根据组件的有效版本（EffectiveVersion）来启用或禁用某些特性，
+		// 实现版本兼容性控制
+		ComponentGlobalsRegistry: componentGlobalsRegistry,
 	}
 }
 
@@ -169,17 +207,33 @@ func (s *ServerRunOptions) ApplyTo(c *server.Config) error {
 }
 
 // DefaultAdvertiseAddress sets the field AdvertiseAddress if unset. The field will be set based on the SecureServingOptions.
+// DefaultAdvertiseAddress 如果 AdvertiseAddress 字段未被设置，则为其设置一个默认值。
+// 这个默认值是根据 SecureServingOptions（安全服务配置）来推断的。
 func (s *ServerRunOptions) DefaultAdvertiseAddress(secure *SecureServingOptions) error {
 	if secure == nil {
 		return nil
 	}
-
+	// 检查 AdvertiseAddress 是否需要被设置。
+	// 满足以下任一条件时，需要进行设置：
+	// 1. s.AdvertiseAddress == nil: 用户完全没有通过命令行 `--advertise-address` 提供这个值。
+	// 2. s.AdvertiseAddress.IsUnspecified(): 用户提供的值是 "0.0.0.0"，这是一个“未指定”的地址，
+	//    不能作为广播地址，因为它对于集群中的其他组件来说没有意义。
 	if s.AdvertiseAddress == nil || s.AdvertiseAddress.IsUnspecified() {
+		// 调用 secure.DefaultExternalAddress() 来获取一个合适的外部地址。
+		// 这个辅助函数的逻辑通常是：
+		// 1. 检查 `secure.BindAddress`。如果它是一个具体的、非 "0.0.0.0" 的 IP 地址，就直接返回它。
+		// 2. 如果 `secure.BindAddress` 是 "0.0.0.0"，则尝试遍历本机所有的网络接口，
+		//    找到一个最合适的、可路由的默认 IP 地址（通常是分配在 `eth0` 等主网卡上的地址）。
 		hostIP, err := secure.DefaultExternalAddress()
 		if err != nil {
+			// 如果 `DefaultExternalAddress` 找不到任何合适的 IP 地址（例如，机器没有任何配置好的网络接口），
+			// 就会返回一个错误。
+			// 错误信息提示用户直接设置 AdvertiseAddress，或者提供一个有效的 BindAddress 来帮助推断。
 			return fmt.Errorf("Unable to find suitable network address.error='%v'. "+
 				"Try to set the AdvertiseAddress directly or provide a valid BindAddress to fix this.", err)
 		}
+		// 将找到的 IP 地址赋值给 AdvertiseAddress。
+
 		s.AdvertiseAddress = hostIP
 	}
 

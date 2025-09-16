@@ -142,24 +142,55 @@ type AuditWebhookOptions struct {
 	GroupVersionString string
 }
 
+// AuditOptions 包含了所有与审计相关的配置选项。
+// 审计功能主要支持两种后端（Backend）：Webhook 和 Log 文件。
+// 这个结构体允许你同时配置这两种后端。
 func NewAuditOptions() *AuditOptions {
+	// 返回一个新创建的 AuditOptions 结构体的指针。
+	// 这个结构体被初始化为两部分：Webhook 的默认配置和 Log 文件的默认配置。
 	return &AuditOptions{
+		// --- Webhook 后端默认配置 ---
 		WebhookOptions: AuditWebhookOptions{
+			// InitialBackoff 设置当 Webhook 服务器无响应时，首次重试的等待时间。
+			// 默认为 10 秒。这是一个指数退避策略的起始值。
 			InitialBackoff: pluginwebhook.DefaultInitialBackoffDelay,
+			// BatchOptions 配置 Webhook 的批量发送模式。
 			BatchOptions: AuditBatchOptions{
-				Mode:        ModeBatch,
-				BatchConfig: defaultWebhookBatchConfig(),
+				// Mode 设置批量处理的模式。
+				// ModeBatch 表示“异步批量发送”。审计事件会先被放入一个缓冲区，
+				// 然后由一个后台 goroutine 定期将缓冲区中的事件打包成一批，发送出去。
+				// 这种模式性能好，但可能会丢失少量事件（如果 apiserver 在发送前崩溃）。
+				Mode: ModeBatch,
+				// BatchConfig 包含具体的批量参数。
+				BatchConfig: defaultWebhookBatchConfig(), // 调用函数获取 Webhook 的默认批量配置
 			},
-			TruncateOptions:    NewAuditTruncateOptions(),
+			// TruncateOptions 配置审计事件在发送前如何被截断，以防止事件体过大。
+			TruncateOptions: NewAuditTruncateOptions(),
+			// GroupVersionString 指定发送到 Webhook 的审计事件对象的 API 版本。
+			// "audit.k8s.io/v1" 是当前稳定的审计事件版本。
 			GroupVersionString: "audit.k8s.io/v1",
 		},
+		// --- Log 文件后端默认配置 ---
 		LogOptions: AuditLogOptions{
+			// Format 指定写入日志文件的格式。
+			// "json" 是默认格式，每个审计事件都是一个 JSON 对象，方便机器解析。
+			// 另一个选项是 "legacy"，但已不推荐使用。
 			Format: pluginlog.FormatJson,
+			// BatchOptions 配置 Log 文件的批量写入模式。
+
 			BatchOptions: AuditBatchOptions{
-				Mode:        ModeBlocking,
+				// Mode 设置批量处理的模式。
+				// ModeBlocking 表示“同步阻塞写入”。每个审计事件都会被同步地写入缓冲区。
+				// 如果缓冲区满了，API 请求处理的 goroutine 会被阻塞，直到有空间为止。
+				// 这种模式保证了审计日志的完整性（不会丢失），但可能会影响 API 服务器的性能。
+				Mode: ModeBlocking,
+				// BatchConfig 包含具体的批量参数。
 				BatchConfig: defaultLogBatchConfig(),
 			},
-			TruncateOptions:    NewAuditTruncateOptions(),
+			// TruncateOptions 配置审计事件在写入文件前如何被截断。
+			TruncateOptions: NewAuditTruncateOptions(),
+			// GroupVersionString 指定写入日志文件的审计事件对象的 API 版本。
+
 			GroupVersionString: "audit.k8s.io/v1",
 		},
 	}

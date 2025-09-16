@@ -58,31 +58,56 @@ type DiscoveryController struct {
 	queue workqueue.TypedRateLimitingInterface[schema.GroupVersion]
 }
 
+// NewDiscoveryController 构造一个新的 DiscoveryController 实例。
 func NewDiscoveryController(
-	crdInformer informers.CustomResourceDefinitionInformer,
-	versionHandler *versionDiscoveryHandler,
-	groupHandler *groupDiscoveryHandler,
-	resourceManager discoveryendpoint.ResourceManager,
+	crdInformer informers.CustomResourceDefinitionInformer, // CRD 的 Informer，用于监听 CRD 变化。
+	versionHandler *versionDiscoveryHandler, // 处理版本级别发现（如 /apis/group/v1）的 HTTP 处理器。
+	groupHandler *groupDiscoveryHandler, // 处理组级别发现（如 /apis/group）的 HTTP 处理器。
+	resourceManager discoveryendpoint.ResourceManager, // 新的、聚合式的服务发现管理器。
 ) *DiscoveryController {
+	// --- 1. 创建并初始化控制器结构体 ---
 	c := &DiscoveryController{
+		// 存储依赖项，这些是控制器需要去更新的目标。
 		versionHandler:  versionHandler,
 		groupHandler:    groupHandler,
 		resourceManager: resourceManager,
-		crdLister:       crdInformer.Lister(),
-		crdsSynced:      crdInformer.Informer().HasSynced,
-
+		// 从 Informer 获取 Lister 和 Synced 函数。
+		// Lister 提供了一个快速的、只读的、从本地缓存中获取 CRD 的方法。
+		crdLister: crdInformer.Lister(),
+		// Synced 函数用于判断 Informer 的本地缓存是否已与 API Server 完全同步。
+		crdsSynced: crdInformer.Informer().HasSynced,
+		// --- 2. 创建工作队列 (Work Queue) ---
+		// 这是控制器模式的核心。它是一个带速率限制的队列，用于存放需要处理的工作项。
+		// 工作项的类型是 `schema.GroupVersion`，意味着当一个 CRD 变化时，
+		// 我们会将受影响的 API 组和版本（如 "apps/v1"）放入队列中等待处理。
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[schema.GroupVersion](),
 			workqueue.TypedRateLimitingQueueConfig[schema.GroupVersion]{Name: "DiscoveryController"},
 		),
 	}
-
+	// --- 3. 注册事件处理器 (Event Handlers) ---
+	// 将控制器的处理函数注册到 CRD Informer 上。
+	// 当 Informer 监听到 CRD 资源发生变化时，会调用这些函数。
 	crdInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.addCustomResourceDefinition,
+		// 当一个 CRD 被创建时，调用 c.addCustomResourceDefinition。
+		AddFunc: c.addCustomResourceDefinition,
+		// 当一个 CRD 被更新时，调用 c.updateCustomResourceDefinition。
 		UpdateFunc: c.updateCustomResourceDefinition,
+		// 当一个 CRD 被删除时，调用 c.deleteCustomResourceDefinition。
 		DeleteFunc: c.deleteCustomResourceDefinition,
 	})
+	// 这些 Add/Update/Delete 函数的内部逻辑通常是：
+	// 1. 从事件中解析出 CRD 对象。
+	// 2. 确定这个变化影响了哪些 GroupVersion。
+	// 3. 将这些 GroupVersion 作为工作项添加到上面的 `queue` 中。
 
+	// --- 4. 设置同步函数 (Sync Function) ---
+	// `c.sync` 是实际执行“协调”逻辑的函数。
+	// 控制器的主循环会从队列中取出一个 GroupVersion，然后调用 `c.sync(groupVersion)`。
+	// `c.sync` 的工作是：
+	// 1. 根据 GroupVersion，从 crdLister 中获取所有相关的 CRD。
+	// 2. 计算出这个 GroupVersion 最新的、正确的服务发现信息。
+	// 3. 更新 `versionHandler`, `groupHandler` 和 `resourceManager` 的状态。
 	c.syncFn = c.sync
 
 	return c
@@ -292,14 +317,22 @@ func (c *DiscoveryController) Run(stopCh <-chan struct{}, synchedCh chan<- struc
 	defer klog.Info("Shutting down DiscoveryController")
 
 	klog.Info("Starting DiscoveryController")
-
+	// --- 2. 等待 Informer 缓存同步 ---
+	// `cache.WaitForCacheSync` 会阻塞，直到 `c.crdsSynced` 函数返回 true，或者 `stopCh` 被关闭。
+	// 这一步至关重要，它确保了在控制器开始工作之前，其本地缓存 (`crdLister`) 已经与 API Server 完全同步。
+	// 如果没有这一步，控制器可能会基于一个不完整的、过时的数据集做出错误的决策。
 	if !cache.WaitForCacheSync(stopCh, c.crdsSynced) {
 		utilruntime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
 		return
 	}
 
 	// initially sync all group versions to make sure we serve complete discovery
+	// --- 3. 执行初始的全量同步 ---
+	// 在启动后台 worker 之前，先主动地、一次性地同步所有已存在的 CRD 的服务发现信息。
+	// 这确保了 API 服务器在启动后能立即提供完整的服务发现，而不是等待事件逐个触发。
 	if err := wait.PollUntilContextCancel(context.Background(), time.Second, true, func(ctx context.Context) (bool, error) {
+		// 从本地缓存中列出所有的 CRD。
+
 		crds, err := c.crdLister.List(labels.Everything())
 		if err != nil {
 			utilruntime.HandleError(fmt.Errorf("failed to initially list CRDs: %v", err))
@@ -308,12 +341,14 @@ func (c *DiscoveryController) Run(stopCh <-chan struct{}, synchedCh chan<- struc
 		for _, crd := range crds {
 			for _, v := range crd.Spec.Versions {
 				gv := schema.GroupVersion{Group: crd.Spec.Group, Version: v.Name}
+				// 直接调用 sync 函数来处理每个 GroupVersion。
 				if err := c.sync(gv); err != nil {
 					utilruntime.HandleError(fmt.Errorf("failed to initially sync CRD version %v: %v", gv, err))
 					return false, nil
 				}
 			}
 		}
+		// 所有 CRD 都已成功同步，返回 true 退出轮询。
 		return true, nil
 	}); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -323,34 +358,68 @@ func (c *DiscoveryController) Run(stopCh <-chan struct{}, synchedCh chan<- struc
 		utilruntime.HandleError(fmt.Errorf("unexpected error: %w", err))
 		return
 	}
+	// --- 4. 通知调用者初始同步已完成 ---
+	// 关闭 `synchedCh` channel，这是一个信号，告诉 `Run` 的调用者（通常是 APIServer 的启动逻辑）
+	// 服务发现已经准备就绪，可以继续下一步了。
 	close(synchedCh)
 
 	// only start one worker thread since its a slow moving API
+	// --- 5. 启动后台 Worker ---
+	// 启动一个后台 goroutine 来持续处理队列中的工作项。
+	// `wait.Until` 会定期（每秒）调用 `c.runWorker`，直到 `stopCh` 被关闭。
+	// 注释中提到“只启动一个 worker”，是因为 CRD 的变化频率不高（"slow moving API"），
+	// 一个 worker 就足以处理了。对于变化频繁的资源（如 Pods），通常会启动多个 worker。
 	go wait.Until(c.runWorker, time.Second, stopCh)
 
 	<-stopCh
 }
 
 func (c *DiscoveryController) runWorker() {
+	// `for c.processNextWorkItem()` 会一直循环，直到 `processNextWorkItem` 返回 `false`。
+	// `processNextWorkItem` 只在队列被关闭时才会返回 `false`。
 	for c.processNextWorkItem() {
 	}
 }
 
 // processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
+// processNextWorkItem 负责处理队列中的一个工作项。当需要退出时，它返回 false。
 func (c *DiscoveryController) processNextWorkItem() bool {
+	// --- 1. 从队列中获取工作项 ---
+	// `c.queue.Get()` 是一个阻塞操作。如果队列为空，它会一直等待，直到有新的工作项被加入。
 	key, quit := c.queue.Get()
+	// 如果 `quit` 为 true，说明队列已经被关闭了（通过 `c.queue.ShutDown()`）。
+	// 这是 worker 协程退出的信号。
 	if quit {
 		return false
 	}
+	// `defer c.queue.Done(key)` 至关重要。它通知队列，我们已经处理完了这个 key。
+	// 如果不调用 `Done`，这个 key 会被认为一直在处理中，这会影响速率限制器的计算。
 	defer c.queue.Done(key)
-
+	// --- 2. 调用核心的同步函数 ---
+	// `c.syncFn(key)` 就是我们之前分析过的 `c.sync(key)` 函数。
+	// 它会执行实际的协调逻辑（例如，检查名称冲突、更新服务发现等）。
 	err := c.syncFn(key)
+	// --- 3. 根据处理结果操作队列 ---
+
 	if err == nil {
+		// 如果 `syncFn` 返回 nil，表示这个 key 已经被成功处理了。
+
+		// `c.queue.Forget(key)` 告诉速率限制器“忘记”这个 key。
+		// 如果这个 key 之前因为处理失败而被多次重试，`Forget` 会重置它的失败计数，
+		// 这样下次它再出现时，就不会被立即限流。
 		c.queue.Forget(key)
 		return true
 	}
 
+	// 如果 `syncFn` 返回了错误，表示处理失败，我们需要重试。
+
+	// `utilruntime.HandleError` 是一个标准的错误处理函数，它会打印错误日志，但不会让程序 panic。
+
 	utilruntime.HandleError(fmt.Errorf("%v failed with: %v", key, err))
+
+	// `c.queue.AddRateLimited(key)` 将处理失败的 key 重新放回队列中，以便稍后重试。
+	// “RateLimited”意味着它不会立即被重新处理，而是会根据速率限制器的策略（通常是指数退避）
+	// 等待一段时间后再被 `Get()` 取出。这可以防止因一个有问题的资源而导致控制器陷入疯狂的重试循环。
 	c.queue.AddRateLimited(key)
 
 	return true

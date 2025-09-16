@@ -51,15 +51,36 @@ type AdmissionOptions struct {
 //	Provides the list of RecommendedPluginOrder that holds sane values
 //	that can be used by servers that don't care about admission chain.
 //	Servers that do care can overwrite/append that field after creation.
+
+// NewAdmissionOptions 创建一个新的 AdmissionOptions 实例。
+//
+// 注意：
+//  1. 除了创建对象，它还会调用 RegisterAllAdmissionPlugins 来注册所有内置于 kube-apiserver 的准入插件。
+//  2. 它提供了 RecommendedPluginOrder 字段，其中包含了一组经过深思熟虑的、合理的插件执行顺序。
+//     不关心准入链顺序的服务器可以直接使用这个默认值。
+//     而关心顺序的服务器可以在创建此对象后，覆盖或追加该字段的内容。
 func NewAdmissionOptions() *AdmissionOptions {
+	// 首先，调用通用的构造函数，创建一个基础的、不包含任何特定插件的 AdmissionOptions 对象。
+	// 这个通用对象只提供了存放插件列表、顺序等配置的“容器”。
 	options := genericoptions.NewAdmissionOptions()
 	// register all admission plugins
+	// 注册所有 kube-apiserver 内置的准入插件。
+	// 这是一个非常关键的步骤：它将所有插件的“工厂函数”注册到 options.Plugins 这个“插件注册表”中。
+	// 这样，后续的逻辑就可以根据名称（如 "MutatingAdmissionWebhook"）来查找并初始化对应的插件实例。
 	RegisterAllAdmissionPlugins(options.Plugins)
 	// set RecommendedPluginOrder
+	// 设置推荐的插件执行顺序。
+	// AllOrderedPlugins 是一个预先定义好的字符串切片，它规定了所有已知插件的执行顺序。
+	// 这个顺序至关重要，例如，修改性质的插件（Mutating）必须在验证性质的插件（Validating）之前执行。
 	options.RecommendedPluginOrder = AllOrderedPlugins
 	// set DefaultOffPlugins
+	// 设置默认关闭的插件列表。
+	// Kubernetes 有一些准入插件因为安全风险、性能影响或功能待完善等原因，默认是不开启的。
+	// 这个列表告诉 API 服务器，即使用户没有通过 --disable-admission-plugins 参数明确禁用它们，
+	// 也不要默认启用它们。
 	options.DefaultOffPlugins = DefaultOffAdmissionPlugins()
-
+	// 返回一个包装了通用选项的 kube-apiserver 特定 AdmissionOptions 对象。
+	// 这种包装结构为未来在不破坏通用性的前提下，扩展 kube-apiserver 自身的准入选项提供了可能。
 	return &AdmissionOptions{
 		GenericAdmission: options,
 	}

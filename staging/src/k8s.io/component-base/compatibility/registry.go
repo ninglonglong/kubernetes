@@ -337,42 +337,72 @@ func (r *componentGlobalsRegistry) SetFallback() error {
 	return r.Set()
 }
 
+// 这个方法应该在所有组件注册完成后，且在服务器启动前被调用一次。
+
 func (r *componentGlobalsRegistry) Set() error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+	// 标记 Set() 方法已经被调用。这可以防止重复调用导致意外的行为。
 	r.set = true
+	// --- 1. 处理模拟版本 (Emulation Version) ---
+
+	// 将用户传入的 `--emulation-version-config` 字符串（如 "kube-apiserver=v1.28"）
+	// 解析成一个 map[string]version.Version 的映射。
 	emulationVersionConfigMap, err := toVersionMap(r.emulationVersionConfig)
 	if err != nil {
 		return err
 	}
+	// 验证用户指定的模拟版本配置是否合法。
 	for comp := range emulationVersionConfigMap {
+		// 检查组件是否已经被注册。
 		if _, ok := r.componentGlobals[comp]; !ok {
 			return fmt.Errorf("component not registered: %s", comp)
 		}
 		// only components without any dependencies can be set from the flag.
+		// 检查这个组件的模拟版本是否是由其他组件“依赖推导”出来的。
+		// 如果是，那么它就不能被用户直接通过命令行参数设置，以避免冲突。
 		if r.componentGlobals[comp].dependentEmulationVersion {
 			return fmt.Errorf("EmulationVersion of %s is set by mapping, cannot set it by flag", comp)
 		}
 	}
+	// 获取完整的模拟版本配置。
+	// `getFullEmulationVersionConfig` 会处理版本依赖，例如，如果 kube-apiserver 的模拟版本是 v1.28，
+	// 那么依赖于它的 kube-controller-manager 的模拟版本也应该被设置为 v1.28。
+	// 这个函数会返回一个包含了所有直接设置和间接推导出的模拟版本的完整 map。
 	if emulationVersions, err := r.getFullEmulationVersionConfig(emulationVersionConfigMap); err != nil {
 		return err
 	} else {
+		// 将计算出的最终模拟版本应用到每个组件的 effectiveVersion 对象中。
 		for comp, ver := range emulationVersions {
 			r.componentGlobals[comp].effectiveVersion.SetEmulationVersion(ver)
 		}
 	}
 	// Set feature gate emulation version before setting feature gate flag values.
+	// --- 2. 将模拟版本应用到特性门控 (Feature Gate) ---
+
+	// 这一步非常关键：在设置具体的特性门控开关（如 "MyFeature=true"）之前，
+	// 必须先告诉每个特性门控集合，它应该“模拟”哪个版本的行为。
 	for comp, globals := range r.componentGlobals {
 		if globals.featureGate == nil {
 			continue
 		}
 		klog.V(klogLevel).Infof("setting %s:feature gate emulation version to %s", comp, globals.effectiveVersion.EmulationVersion().String())
+		// 调用 featureGate.SetEmulationVersion()。这个方法会根据模拟的版本号，
+		// 自动设置所有特性门控的默认值。例如，在 v1.28 中某个特性可能是 Beta (默认开启)，
+		// 但在 v1.27 中它是 Alpha (默认关闭)。设置模拟版本后，即使 apiserver 是 v1.28 的二进制，
+		// 它也会表现得像 v1.27 一样，将该特性默认关闭。
 		if err := globals.featureGate.SetEmulationVersion(globals.effectiveVersion.EmulationVersion()); err != nil {
 			return err
 		}
 	}
+	// --- 3. 应用用户指定的特性门控开关 ---
+
+	// 遍历从 `--feature-gates` 命令行参数解析来的配置。
 	for comp, fg := range r.featureGatesConfig {
 		if comp == "" {
+			// 处理一个特殊情况：如果组件名是空字符串，它代表“默认组件”，通常是 "kube"。
+			// `--feature-gates=kube:AnotherFeature=true` 不能同时使用。
+
 			if _, ok := r.featureGatesConfig[DefaultKubeComponent]; ok {
 				return fmt.Errorf("set kube feature gates with default empty prefix or kube: prefix consistently, do not mix use")
 			}

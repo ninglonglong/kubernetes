@@ -58,14 +58,27 @@ type CompletedConfig struct {
 	*completedConfig
 }
 
+// Complete 填充 Config 对象及其所有子配置对象中缺失的字段。
+// 这个方法本身不做太多实际工作，而是将“补全”的任务委派给每个子配置对象自己的 Complete 方法。
 func (c *Config) Complete() (CompletedConfig, error) {
+	// 创建并返回一个 CompletedConfig 对象。
+	// 这个对象内部的 `completedConfig` 结构体包含了所有补全后的子配置。
 	return CompletedConfig{&completedConfig{
+		// 直接将原始的 CompletedOptions 传递下去。
 		Options: c.Options,
 
+		// --- 核心的委派逻辑 ---
+		// 调用每个子配置对象各自的 Complete() 方法。
+		// 1. `c.Aggregator.Complete()`: 补全聚合层 apiserver 的配置。
+		//    这会填充与 API Service 代理、认证等相关的默认值。
+		// 2. `c.ControlPlane.Complete()`: 补全核心控制平面 apiserver 的配置。
+		//    这是最复杂的一步，会处理核心 API 的存储、版本、默认准入插件等。
+		// 3. `c.APIExtensions.Complete()`: 补全 API 扩展 apiserver 的配置。
+		//    这会处理与 CRD (CustomResourceDefinition) 相关的配置。
 		Aggregator:    c.Aggregator.Complete(),
 		ControlPlane:  c.ControlPlane.Complete(),
 		APIExtensions: c.APIExtensions.Complete(),
-
+		// 直接传递 ExtraConfig，因为它通常不需要“补全”操作。
 		ExtraConfig: c.ExtraConfig,
 	}}, nil
 }

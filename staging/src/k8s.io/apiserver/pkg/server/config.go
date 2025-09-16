@@ -393,11 +393,18 @@ func init() {
 }
 
 // NewConfig returns a Config struct with the default values
+// NewConfig 创建一个通用的 API 服务器配置对象（Config），并为其填充一系列社区推荐的默认值。
+// 这个 Config 对象是构建一个 API 服务器实例的蓝图。
 func NewConfig(codecs serializer.CodecFactory) *Config {
+	// --- 1. 健康检查默认配置 ---
+	// 定义一组默认的健康检查器。PingHealthz 检查服务器是否能响应，LogHealthz 检查日志系统是否正常。
 	defaultHealthChecks := []healthz.HealthChecker{healthz.PingHealthz, healthz.LogHealthz}
+	// --- 2. APIServer Identity (身份标识) ---
 	var id string
+	// 检查 APIServerIdentity 这个特性门控是否被启用。
+	// 这个特性为每个 apiserver 实例提供一个唯一的、稳定的 ID，用于 Lease 对象的争抢等场景。
 	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerIdentity) {
-		hostname, err := hostnameFunc()
+		hostname, err := hostnameFunc() // 获取当前机器的主机名
 		if err != nil {
 			klog.Fatalf("error getting hostname for apiserver identity: %v", err)
 		}
@@ -406,7 +413,10 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 		// the hash used for the identity should include both the hostname and the identity value.
 		// TODO: receive the identity value as a parameter once the apiserver identity lease controller
 		// post start hook is moved to generic apiserver.
+		// 为了确保在所有 kube-apiserver 和聚合 apiserver 之间哈希值是唯一的，
+		// 哈希的原始数据应该包含主机名和一个固定的身份值（这里是 "kube-apiserver"）。
 		b := cryptobyte.NewBuilder(nil)
+		// 使用 TLV (Type-Length-Value) 格式来构建数据，确保字段之间不会混淆。
 		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
 			b.AddBytes([]byte(hostname))
 		})
@@ -421,31 +431,48 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 		hash := sha256.Sum256(hashData)
 		id = "apiserver-" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(hash[:16]))
 	}
+	// --- 3. 生命周期信号 ---
+	// 创建用于协调服务器启动、关闭和健康状态的信号通道。
 	lifecycleSignals := newLifecycleSignals()
 
 	return &Config{
-		Serializer:                     codecs,
-		BuildHandlerChainFunc:          DefaultBuildHandlerChain,
+		// 序列化与反序列化相关：编解码器工厂，用于处理不同版本的 API 对象。
+		Serializer: codecs,
+		// HTTP 请求处理链：用于构建包含认证、授权、准入控制等一系列过滤器的 HTTP Handler 链。
+		BuildHandlerChainFunc: DefaultBuildHandlerChain,
+		// 等待组：用于在优雅关闭时，等待所有正在处理的“非长连接”请求完成。
 		NonLongRunningRequestWaitGroup: new(utilwaitgroup.SafeWaitGroup),
-		WatchRequestWaitGroup:          &utilwaitgroup.RateLimitedSafeWaitGroup{},
-		LegacyAPIGroupPrefixes:         sets.NewString(DefaultLegacyAPIPrefix),
-		DisabledPostStartHooks:         sets.NewString(),
-		PostStartHooks:                 map[string]PostStartHookConfigEntry{},
-		HealthzChecks:                  append([]healthz.HealthChecker{}, defaultHealthChecks...),
-		ReadyzChecks:                   append([]healthz.HealthChecker{}, defaultHealthChecks...),
-		LivezChecks:                    append([]healthz.HealthChecker{}, defaultHealthChecks...),
-		EnableIndex:                    true,
-		EnableDiscovery:                true,
-		EnableProfiling:                true,
-		DebugSocketPath:                "",
-		EnableMetrics:                  true,
-		MaxRequestsInFlight:            400,
-		MaxMutatingRequestsInFlight:    200,
-		RequestTimeout:                 time.Duration(60) * time.Second,
-		MinRequestTimeout:              1800,
-		StorageInitializationTimeout:   time.Minute,
-		LivezGracePeriod:               time.Duration(0),
-		ShutdownDelayDuration:          time.Duration(0),
+		// 等待组：专门用于等待 watch 请求的完成，并带有速率限制。
+		WatchRequestWaitGroup: &utilwaitgroup.RateLimitedSafeWaitGroup{},
+		// 旧版 API 组前缀：如 "/api"，用于兼容旧的 API 访问路径。
+		LegacyAPIGroupPrefixes: sets.NewString(DefaultLegacyAPIPrefix),
+		// 禁用的启动后钩子：一个集合，用于禁用某些默认的 PostStartHook。
+		DisabledPostStartHooks: sets.NewString(),
+		// 启动后钩子：一个 map，用于注册在服务器主循环启动后需要执行的任务（如启动各种控制器）。
+		PostStartHooks: map[string]PostStartHookConfigEntry{},
+		// 健康检查：/healthz 端点的检查器列表，默认包含 ping 和 log 检查。
+		HealthzChecks: append([]healthz.HealthChecker{}, defaultHealthChecks...),
+		// 就绪检查：/readyz 端点的检查器列表，默认与 healthz 相同。
+		ReadyzChecks: append([]healthz.HealthChecker{}, defaultHealthChecks...),
+		// 存活检查：/livez 端点的检查器列表，默认与 healthz 相同。
+		LivezChecks: append([]healthz.HealthChecker{}, defaultHealthChecks...),
+		// 是否启用 API 索引页 ("/apis")。
+		EnableIndex: true,
+		// 是否启用 API 发现页（如 "/apis/apps/v1"）。
+		EnableDiscovery: true,
+		// 是否启用性能分析端点 ("/debug/pprof")。
+		EnableProfiling: true,
+		// 调试用的 Unix Socket 路径，如果设置了，可以通过它进行调试。
+		DebugSocketPath: "",
+		// 是否启用指标暴露端点 ("/metrics")。
+		EnableMetrics:                true,
+		MaxRequestsInFlight:          400,
+		MaxMutatingRequestsInFlight:  200,
+		RequestTimeout:               time.Duration(60) * time.Second,
+		MinRequestTimeout:            1800,
+		StorageInitializationTimeout: time.Minute,
+		LivezGracePeriod:             time.Duration(0),
+		ShutdownDelayDuration:        time.Duration(0),
 		// 1.5MB is the default client request size in bytes
 		// the etcd server should accept. See
 		// https://github.com/etcd-io/etcd/blob/release-3.4/embed/config.go#L56.
@@ -466,14 +493,20 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 
 		// Default to treating watch as a long-running operation
 		// Generic API servers have no inherent long-running subresources
-		LongRunningFunc:                     genericfilters.BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString()),
-		lifecycleSignals:                    lifecycleSignals,
-		StorageObjectCountTracker:           flowcontrolrequest.NewStorageObjectCountTracker(),
+		// 长连接请求判断函数：定义哪些请求被认为是“长连接”（如 "watch"），从而走不同的处理逻辑。
+		LongRunningFunc: genericfilters.BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString()),
+		// 内部生命周期信号，用于协调关闭流程。
+		lifecycleSignals: lifecycleSignals,
+		// 存储对象计数器：用于 APF (API Priority and Fairness) 流控，追踪存储层中的对象数量。
+		StorageObjectCountTracker: flowcontrolrequest.NewStorageObjectCountTracker(),
+		// 在优雅关闭期间，允许 watch 请求在被终止前持续的最长时间。
 		ShutdownWatchTerminationGracePeriod: time.Duration(0),
-
-		APIServerID:           id,
+		// API 服务器的唯一标识符，如果特性门控开启，这里会被赋值。
+		APIServerID: id,
+		// 存储版本管理器：用于处理 API 对象的存储版本迁移。
 		StorageVersionManager: storageversion.NewDefaultManager(),
-		TracerProvider:        tracing.NewNoopTracerProvider(),
+		// 分布式追踪提供者：默认是一个空操作的 NoopTracerProvider，即禁用追踪。
+		TracerProvider: tracing.NewNoopTracerProvider(),
 	}
 }
 
@@ -698,42 +731,69 @@ func (c *Config) ShutdownInitiatedNotify() <-chan struct{} {
 
 // Complete fills in any fields not set that are required to have valid data and can be derived
 // from other fields. If you're going to `ApplyOptions`, do that first. It's mutating the receiver.
+// Complete 接收一个 SharedInformerFactory，并为通用 APIServer 配置填充所有缺失的默认值。
 func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedConfig {
+	// --- 1. 基础配置和默认值 ---
+
+	// 如果没有为这个 APIServer 实例单独指定 FeatureGate，就使用全局的默认 FeatureGate。
 	if c.FeatureGate == nil {
 		c.FeatureGate = utilfeature.DefaultFeatureGate
 	}
+	// 如果 ExternalAddress (外部地址) 未设置，但 PublicAddress (公网地址) 已设置，
+	// 则使用 PublicAddress 作为 ExternalAddress。这是一种向后兼容或配置合并的逻辑。
 	if len(c.ExternalAddress) == 0 && c.PublicAddress != nil {
 		c.ExternalAddress = c.PublicAddress.String()
 	}
 
 	// if there is no port, and we listen on one securely, use that one
+	// 确保 ExternalAddress 包含端口号。这对于生成可访问的 URL至关重要。
 	if _, _, err := net.SplitHostPort(c.ExternalAddress); err != nil {
+		// 如果 ExternalAddress 本身不带端口（例如只是一个 IP），则尝试从 SecureServing 配置中推断。
 		if c.SecureServing == nil {
+			// 如果连 SecureServing (HTTPS 服务) 都没有配置，就无法推断端口，这是致命错误。
 			klog.Fatalf("cannot derive external address port without listening on a secure port.")
 		}
+		// 从 SecureServing 配置中获取监听的主机和端口。
 		_, port, err := c.SecureServing.HostPort()
 		if err != nil {
 			klog.Fatalf("cannot derive external address from the secure port: %v", err)
 		}
+		// 将推断出的端口号附加到 ExternalAddress 上。
 		c.ExternalAddress = net.JoinHostPort(c.ExternalAddress, strconv.Itoa(port))
 	}
+	// --- 2. OpenAPI 和服务发现配置 ---
+
+	// 补全 OpenAPI V2 和 V3 的配置。这会根据服务器的模拟版本（EmulationVersion）
+	// 来设置正确的 OpenAPI 规范（spec）模板和行为。
 	completeOpenAPI(c.OpenAPIConfig, c.EffectiveVersion.EmulationVersion())
 	completeOpenAPIV3(c.OpenAPIV3Config, c.EffectiveVersion.EmulationVersion())
 
+	// 如果服务发现地址（DiscoveryAddresses）未设置，则创建一个默认的，
+	// 它会使用我们刚刚精心构造好的 ExternalAddress 作为客户端发现 API 的地址。
 	if c.DiscoveryAddresses == nil {
 		c.DiscoveryAddresses = discovery.DefaultAddresses{DefaultAddress: c.ExternalAddress}
 	}
+	// --- 3. 内部组件和依赖注入 ---
 
+	// 为 Loopback 客户端配置认证信息。
+	// Loopback 客户端是 APIServer 用来调用自己的客户端（例如，执行 admission webhook 调用）。
+	// 这个函数确保了 loopback 客户端拥有一个合法的、能通过本服务器认证和授权的 token。
 	AuthorizeClientBearerToken(c.LoopbackClientConfig, &c.Authentication, &c.Authorization)
-
+	// 如果没有提供自定义的 RequestInfoResolver，就创建一个默认的。
+	// RequestInfoResolver 的作用是解析一个 HTTP 请求，判断它对应的是哪个 API 资源、命名空间、动词等。
 	if c.RequestInfoResolver == nil {
 		c.RequestInfoResolver = NewRequestInfoResolver(c)
 	}
-
+	// 如果没有提供 EquivalentResourceRegistry，就创建一个默认的。
+	// 这个注册表用于声明哪些资源实际上是等价的（例如 `apps/v1.deployments` 和 `apps/v1.deployments/status`）。
 	if c.EquivalentResourceRegistry == nil {
 		if c.RESTOptionsGetter == nil {
+			// 如果没有提供 RESTOptionsGetter，无法获取存储细节，只能创建一个最简单的注册表。
 			c.EquivalentResourceRegistry = runtime.NewEquivalentResourceRegistry()
 		} else {
+			// 如果有 RESTOptionsGetter，就可以创建一个更“智能”的注册表。
+			// 这个注册表使用一个函数来为每个资源生成一个唯一标识。
+			// 该函数会尝试使用资源的“存储前缀”作为标识，这能更准确地判断资源是否等价。
 			c.EquivalentResourceRegistry = runtime.NewEquivalentResourceRegistryWithIdentity(func(groupResource schema.GroupResource) string {
 				// use the storage prefix as the key if possible
 				if opts, err := c.RESTOptionsGetter.GetRESTOptions(groupResource, nil); err == nil {
@@ -744,7 +804,10 @@ func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedCo
 			})
 		}
 	}
+	// --- 4. 返回最终配置 ---
 
+	// 将已经补全的 `c` (Config) 和传入的 `informers` 一起包装成 CompletedConfig 并返回。
+	// `informers` 会被后续的服务器构建过程使用，例如用于准入控制器。
 	return CompletedConfig{&completedConfig{c, informers}}
 }
 
@@ -1011,82 +1074,176 @@ func BuildHandlerChainWithStorageVersionPrecondition(apiHandler http.Handler, c 
 	return DefaultBuildHandlerChain(handler, c)
 }
 
+// DefaultBuildHandlerChain 构建了 apiserver 的标准 HTTP 处理器链（Handler Chain）。
+// 这是一个经典的“洋葱模型”，每个处理器（中间件）将下一个处理器包裹起来，对请求进行层层处理。
+//
+// 参数:
+//
+//	apiHandler: http.Handler - 这是最核心的业务逻辑处理器，通常是 go-restful 的 Mux，负责将请求路由到具体的 REST 实现。
+//	c: *Config - 包含了 apiserver 的所有配置信息，如认证、授权、审计等。
+//
+// 返回:
+//
+//	http.Handler - 经过层层包裹后的、完整的处理器链的入口。
 func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
+
 	handler := apiHandler
-
+	// --- 包裹授权 (Authorization) ---
+	// 在进入此处理器之前，请求必须已经通过了认证、审计等更外层的处理器。
+	// 这个处理器检查已认证的用户是否有权限执行当前请求的操作。
+	// TrackCompleted 标记此阶段的结束，用于延迟跟踪。
+	klog.V(4).Infof("TrackCompleted 标记此阶段的结束，用于延迟跟踪。")
 	handler = filterlatency.TrackCompleted(handler)
+	// WithAuthorization 是授权的核心，如果授权失败，它将终止请求并返回 403 Forbidden。
+	klog.V(4).Infof("WithAuthorization 是授权的核心，如果授权失败，它将终止请求并返回 403 Forbidden。")
 	handler = genericapifilters.WithAuthorization(handler, c.Authorization.Authorizer, c.Serializer)
+	// TrackStarted 标记授权阶段的开始，用于延迟跟踪。
+	klog.V(4).Infof(" TrackStarted 标记授权阶段的开始，用于延迟跟踪")
 	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "authorization")
-
+	// --- 包裹流量控制 (Flow Control) ---
+	klog.V(4).Infof("- 包裹流量控制 (Flow Control)")
 	if c.FlowControl != nil {
+		// 如果启用了 APF (API 优先级与公平性)
+		// 创建一个请求工作量估算器，用于评估每个请求的“成本”。
+		klog.V(4).Infof("创建一个请求工作量估算器，用于评估每个请求的“成本”")
 		workEstimatorCfg := flowcontrolrequest.DefaultWorkEstimatorConfig()
 		requestWorkEstimator := flowcontrolrequest.NewWorkEstimator(
 			c.StorageObjectCountTracker.Get, c.FlowControl.GetInterestedWatchCount, workEstimatorCfg, c.FlowControl.GetMaxSeats)
+		// 包裹 APF 处理器。它会根据请求的优先级和当前系统负载，决定是立即执行还是排队等待。
+		klog.V(4).Infof(" 包裹 APF 处理器。它会根据请求的优先级和当前系统负载，决定是立即执行还是排队等待。")
 		handler = filterlatency.TrackCompleted(handler)
 		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl, requestWorkEstimator, c.RequestTimeout/4)
 		handler = filterlatency.TrackStarted(handler, c.TracerProvider, "priorityandfairness")
 	} else {
+		// 如果使用旧的最大并发请求数限制 (MaxInFlight)
+		// 这个处理器会限制同时在服务器中处理的请求总数。
+		klog.V(4).Infof("这个处理器会限制同时在服务器中处理的请求总数。。")
 		handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight, c.MaxMutatingRequestsInFlight, c.LongRunningFunc)
 	}
-
+	// --- 包裹用户模拟 (Impersonation) ---
+	// 允许高权限用户模拟成其他用户来发起请求。此处理器会校验模拟操作是否被授权。
+	klog.V(4).Infof(" 允许高权限用户模拟成其他用户来发起请求。此处理器会校验模拟操作是否被授权。。")
 	handler = filterlatency.TrackCompleted(handler)
+
 	handler = genericapifilters.WithImpersonation(handler, c.Authorization.Authorizer, c.Serializer)
 	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "impersonation")
-
+	// --- 包裹审计 (Audit) ---
+	// 记录关于请求的详细信息（谁、在何时、做了什么），用于事后追踪和安全分析。
+	klog.V(4).Infof("记录关于请求的详细信息（谁、在何时、做了什么），用于事后追踪和安全分析。。。")
 	handler = filterlatency.TrackCompleted(handler)
 	handler = genericapifilters.WithAudit(handler, c.AuditBackend, c.AuditPolicyRuleEvaluator, c.LongRunningFunc)
 	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "audit")
-
+	// --- 包裹认证 (Authentication) ---
+	// 这是非常关键的一层，它识别请求者的身份。
+	// 首先，定义一个处理认证失败的 handler。如果认证失败，请求会走向这里。
+	klog.V(4).Infof("首先，定义一个处理认证失败的 handler。如果认证失败，请求会走向这里。")
 	failedHandler := genericapifilters.Unauthorized(c.Serializer)
+	// 并为失败的认证尝试也记录审计日志。
+	klog.V(4).Infof("并为失败的认证尝试也记录审计日志。")
 	failedHandler = genericapifilters.WithFailedAuthenticationAudit(failedHandler, c.AuditBackend, c.AuditPolicyRuleEvaluator)
 
 	// WithTracing comes after authentication so we can allow authenticated
 	// clients to influence sampling.
+	// [特性门控] 链路追踪 (Tracing) 处理器。它在认证之后，以便可以根据用户身份决定采样策略。
+	klog.V(4).Infof("[特性门控] 链路追踪 (Tracing) 处理器。它在认证之后，以便可以根据用户身份决定采样策略。。")
 	if c.FeatureGate.Enabled(genericfeatures.APIServerTracing) {
 		handler = genericapifilters.WithTracing(handler, c.TracerProvider)
 	}
+	// 为 failedHandler 和主 handler 都包裹上延迟跟踪。
+	klog.V(4).Infof("为 failedHandler 和主 handler 都包裹上延迟跟踪。")
 	failedHandler = filterlatency.TrackCompleted(failedHandler)
+	// WithAuthentication 是认证的核心。它使用配置的认证器来验证凭证。
+	// 如果成功，请求继续向内层传递；如果失败，则转交给 failedHandler。
+	klog.V(4).Infof("WithAuthentication 是认证的核心。它使用配置的认证器来验证凭证。。")
 	handler = filterlatency.TrackCompleted(handler)
 	handler = genericapifilters.WithAuthentication(handler, c.Authentication.Authenticator, failedHandler, c.Authentication.APIAudiences, c.Authentication.RequestHeaderConfig)
-	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "authentication")
-
+	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "authentication") // 标记认证阶段的开始
+	// --- 包裹 CORS (跨域资源共享) ---
+	// 处理来自浏览器的跨域请求，根据配置的来源列表决定是否允许。
+	klog.V(4).Infof("处理来自浏览器的跨域请求，根据配置的来源列表决定是否允许。。")
 	handler = genericfilters.WithCORS(handler, c.CorsAllowedOriginList, nil, nil, nil, "true")
 
 	// WithWarningRecorder must be wrapped by the timeout handler
 	// to make the addition of warning headers threadsafe
+	// --- 包裹 Warning 头记录器 ---
+	// 此处理器会创建一个上下文，用于收集在请求处理深层产生的警告信息，
+	// 并在最终响应时将它们统一添加到 "Warning" HTTP 头中。
+	klog.V(4).Infof(" 包裹 Warning 头记录器 ---")
 	handler = genericapifilters.WithWarningRecorder(handler)
 
 	// WithTimeoutForNonLongRunningRequests will call the rest of the request handling in a go-routine with the
 	// context with deadline. The go-routine can keep running, while the timeout logic will return a timeout to the client.
+	// --- 包裹超时处理 (Timeout) ---
+	// 为非长连接请求（如 get, list, create）设置一个超时时间。
+	// 如果在规定时间内未处理完，它会直接向客户端返回超时错误，保护服务器。
+	klog.V(4).Infof(" 包为非长连接请求（如 get, list, create）设置一个超时时间。 ---")
 	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc)
-
+	// --- 包裹请求截止时间 (Deadline) ---
+	// 进一步处理请求的截止时间，并与审计系统集成。
+	klog.V(4).Infof(" 进一步处理请求的截止时间，并与审计系统集成。---")
 	handler = genericapifilters.WithRequestDeadline(handler, c.AuditBackend, c.AuditPolicyRuleEvaluator,
 		c.LongRunningFunc, c.Serializer, c.RequestTimeout)
+	// --- 包裹 WaitGroup 管理 ---
+	// 将请求加入 WaitGroup，用于跟踪正在处理的请求总数。这对于实现优雅停机至关重要，
+	// 服务器关闭前会等待所有正在处理的请求完成。
+	klog.V(4).Infof(" 将请求加入 WaitGroup，用于跟踪正在处理的请求总数。这对于实现优雅停机至关重要，---")
 	handler = genericfilters.WithWaitGroup(handler, c.LongRunningFunc, c.NonLongRunningRequestWaitGroup)
+
+	// --- 包裹优雅停机相关的处理器 ---
+	// 在服务器关闭期间，优雅地终止正在进行的 watch 请求。
+	klog.V(4).Infof(" 在服务器关闭期间，优雅地终止正在进行的 watch 请求。，---")
 	if c.ShutdownWatchTerminationGracePeriod > 0 {
 		handler = genericfilters.WithWatchTerminationDuringShutdown(handler, c.lifecycleSignals, c.WatchRequestWaitGroup)
 	}
+	// [HTTP/2] 以一定概率向客户端发送 GOAWAY 帧，促使客户端重连，有助于负载均衡。
+	klog.V(4).Infof(" [HTTP/2] 以一定概率向客户端发送 GOAWAY 帧，促使客户端重连，有助于负载均衡。---")
 	if c.SecureServing != nil && !c.SecureServing.DisableHTTP2 && c.GoawayChance > 0 {
 		handler = genericfilters.WithProbabilisticGoaway(handler, c.GoawayChance)
 	}
+	// --- 包裹基础 HTTP 头处理器 ---
+	// 为响应添加 "Cache-Control: no-cache, private" 头，防止客户端或代理缓存 API 响应。
+	klog.V(4).Infof("为响应添加Cache-Control: no-cache, private 头，防止客户端或代理缓存 API 响应。")
 	handler = genericapifilters.WithCacheControl(handler)
+	// 为响应添加 HSTS (HTTP Strict Transport Security) 头，强制客户端后续使用 HTTPS。
+	klog.V(4).Infof("为响应添加 HSTS (HTTP Strict Transport Security) 头，强制客户端后续使用 HTTPS。")
 	handler = genericfilters.WithHSTS(handler, c.HSTSDirectives)
+
+	// --- 包裹最外层的几个处理器 ---
+	// 当服务器正在关闭时，向新来的请求返回 503 Service Unavailable 并附带 Retry-After 头。
+	klog.V(4).Infof("当服务器正在关闭时，向新来的请求返回 503 Service Unavailable 并附带 Retry-After 头。。")
 	if c.ShutdownSendRetryAfter {
 		handler = genericfilters.WithRetryAfter(handler, c.lifecycleSignals.NotAcceptingNewRequest.Signaled())
 	}
+	// 在请求完成时，打印一条详细的 HTTP 日志。这是我们在日志里最常见到的那一行。
 	handler = genericfilters.WithHTTPLogging(handler)
+	// 另一个与延迟跟踪相关的包裹。
 	handler = genericapifilters.WithLatencyTrackers(handler)
 	// WithRoutine will execute future handlers in a separate goroutine and serving
 	// handler in current goroutine to minimize the stack memory usage. It must be
 	// after WithPanicRecover() to be protected from panics.
+	// [特性门控] 使用 Goroutine 处理请求，以减少主 goroutine 的栈内存使用。
+
 	if c.FeatureGate.Enabled(genericfeatures.APIServingWithRoutine) {
 		handler = routine.WithRoutine(handler, c.LongRunningFunc)
 	}
+	// 解析请求的 URL，将其中的信息（verb, resource, namespace 等）封装成 RequestInfo 对象，存入上下文。
+	// 这是非常基础且重要的一步，后续很多处理器都依赖这些信息。
+	klog.V(4).Infof("解析请求的 URL，将其中的信息（verb, resource, namespace 等）封装成 RequestInfo 对象，存入上下文。")
 	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
+	// 在请求对象中注入一个时间戳，记录请求到达服务器的精确时间。
+	klog.V(4).Infof(" 在请求对象中注入一个时间戳，记录请求到达服务器的精确时间。")
 	handler = genericapifilters.WithRequestReceivedTimestamp(handler)
+	// 在 apiserver 完全准备好服务之前，阻塞新来的请求。
+	klog.V(4).Infof("在 apiserver 完全准备好服务之前，阻塞新来的请求。")
 	handler = genericapifilters.WithMuxAndDiscoveryComplete(handler, c.lifecycleSignals.MuxAndDiscoveryComplete.Signaled())
+	// 这是最外层的保护网：捕获请求处理过程中的任何 panic，防止 apiserver 进程崩溃。
+	klog.V(4).Infof("这是最外层的保护网：捕获请求处理过程中的任何 panic，防止 apiserver 进程崩溃。")
 	handler = genericfilters.WithPanicRecovery(handler, c.RequestInfoResolver)
+	// 为每个请求初始化一个审计事件的上下文，供后续的审计处理器使用。
+	klog.V(4).Infof("为每个请求初始化一个审计事件的上下文，供后续的审计处理器使用")
 	handler = genericapifilters.WithAuditInit(handler)
+	// 返回经过层层包裹后的、完整的处理器链的入口。
+
 	return handler
 }
 

@@ -190,47 +190,98 @@ var toDiscoveryKubeVerb = map[string]string{
 }
 
 // Install handlers for API resources.
+// Install 是 APIInstaller 的主方法。它负责创建并填充一个 `restful.WebService`，
+// 这个 WebService 包含了该 API 版本下所有资源的 REST 路由。
+// 它返回：
+// - `apiResources`: 用于服务发现的 APIResource 列表。
+// - `resourceInfos`: 用于 StorageVersion API 的 ResourceInfo 列表。
+// - `ws`: 包含所有已注册路由的 WebService 对象。
+// - `errors`: 安装过程中遇到的错误列表。
 func (a *APIInstaller) Install() ([]metav1.APIResource, []*storageversion.ResourceInfo, *restful.WebService, []error) {
 	var apiResources []metav1.APIResource
 	var resourceInfos []*storageversion.ResourceInfo
 	var errors []error
+
+	// `newWebService` 会创建一个新的 `restful.WebService`，并设置其根路径，
+	// 例如 `/apis/apps/v1`。
 	ws := a.newWebService()
 
 	// Register the paths in a deterministic (sorted) order to get a deterministic swagger spec.
+
+	// --- 核心逻辑：按确定性顺序安装资源 ---
+	// 为了得到一个确定性的 Swagger/OpenAPI 规范（这对于 API 文档和客户端生成的稳定性至关重要），
+	// 我们必须按照一个固定的顺序来注册路由。这里选择按路径的字母顺序。
+
+	// 从 a.group.Storage (这是一个 map[string]rest.Storage) 中提取所有的路径（也就是资源名）。
 	paths := make([]string, len(a.group.Storage))
 	var i int = 0
 	for path := range a.group.Storage {
 		paths[i] = path
 		i++
 	}
+	// 对路径进行字符串排序。
 	sort.Strings(paths)
+	// 按照排好序的路径，遍历并注册每个资源。
 	for _, path := range paths {
+		// `registerResourceHandlers` 是实际干活的函数。
+		// 它会检查 `a.group.Storage[path]` 这个 `rest.Storage` 实现了哪些接口
+		// (如 Getter, Lister, Creater, Updater 等)，
+		// 然后为每个实现的接口，在 `ws` (WebService) 上创建对应的 HTTP 路由。
+		// 例如，如果实现了 Getter，它会创建一个 `GET /.../{name}` 的路由。
 		apiResource, resourceInfo, err := a.registerResourceHandlers(path, a.group.Storage[path], ws)
+		// 收集 `registerResourceHandlers` 的返回结果。
 		if err != nil {
 			errors = append(errors, fmt.Errorf("error in registering resource: %s, %v", path, err))
 		}
 		if apiResource != nil {
+			// `apiResource` 是一个描述这个资源的元数据对象，用于服务发现。
 			apiResources = append(apiResources, *apiResource)
 		}
 		if resourceInfo != nil {
+			// `resourceInfo` 是一个包含存储版本信息的对象，用于 StorageVersion API。
 			resourceInfos = append(resourceInfos, resourceInfo)
 		}
 	}
+	// 返回所有收集到的信息。
 	return apiResources, resourceInfos, ws, errors
 }
 
 // newWebService creates a new restful webservice with the api installer's prefix and version.
 func (a *APIInstaller) newWebService() *restful.WebService {
 	ws := new(restful.WebService)
+	// --- 1. 设置根路径 (Root Path) ---
+	// `ws.Path(a.prefix)` 是最关键的一步。它定义了这个 WebService 下所有路由的共同前缀。
+	// `a.prefix` 通常是 `/apis/<group>/<version>` (例如 `/apis/apps/v1`) 或 `/api/v1`。
+	// 这意味着，之后在这个 `ws` 上注册的任何路由，比如针对 "deployments" 的，
+	// 它的完整路径会自动变成 `/apis/apps/v1/deployments`。
 	ws.Path(a.prefix)
 	// a.prefix contains "prefix/group/version"
+	// 为这个 WebService 设置一个描述性文档，这会出现在自动生成的 API 文档中。
 	ws.Doc("API at " + a.prefix)
 	// Backwards compatibility, we accepted objects with empty content-type at V1.
 	// If we stop using go-restful, we can default empty content-type to application/json on an
 	// endpoint by endpoint basis
+	// --- 2. 设置可接受的请求体类型 (Consumes) ---
+	// `ws.Consumes("*/*")` 表示这个 WebService 接受任何 Content-Type 的请求。
+	// 注释中解释了这是为了向后兼容：在 Kubernetes v1 的早期，API 服务器接受过
+	// Content-Type 为空的请求（并将其默认为 application/json）。
+	// 虽然现在不推荐这样做，但为了保持兼容性，这里设置为接受所有类型。
+	// 如果未来不再使用 go-restful，可以在每个端点上更精确地控制这个行为。
 	ws.Consumes("*/*")
+	// --- 3. 设置可生成的响应体类型 (Produces) ---
+	// `negotiation.MediaTypesForSerializer(a.group.Serializer)` 会根据传入的序列化器（Serializer）
+	// 来确定这个 API 版本支持哪些响应格式。
+	// `a.group.Serializer` 通常是一个支持多种格式的 `NegotiatedSerializer`。
+	// - `mediaTypes`: 一般包含 `application/json` 和 `application/yaml`，以及 Protobuf 格式。
+	// - `streamMediaTypes`: 专门用于 Watch 操作的流式响应格式，如 `application/json;stream=watch`。
 	mediaTypes, streamMediaTypes := negotiation.MediaTypesForSerializer(a.group.Serializer)
+
+	// `ws.Produces(...)` 告诉客户端这个 WebService 能够生成哪些 Content-Type 的响应。
+	// 客户端可以在请求的 `Accept` 头中指定它想要的格式，服务器会根据这个列表进行内容协商。
 	ws.Produces(append(mediaTypes, streamMediaTypes...)...)
+	// --- 4. 设置 API 版本 ---
+	// `ws.ApiVersion(...)` 为这个 WebService 关联一个 API 版本字符串（如 "apps/v1"）。
+	// 这个信息同样也会被用于生成 API 文档。
 	ws.ApiVersion(a.group.GroupVersion.String())
 
 	return ws

@@ -313,34 +313,54 @@ func (c *Config) Complete() CompletedConfig {
 // Certain config fields will be set to a default value if unset.
 // Certain config fields must be specified, including:
 // KubeletClientConfig
+// New 从给定的配置中返回一个新的 Master/Instance 实例。
+// 如果某些配置字段未设置，它们将被设置为默认值。
+// 某些配置字段必须被指定，例如：KubeletClientConfig。
 func (c CompletedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*Instance, error) {
+	// --- 1. 前置校验 ---
+	// 确保 KubeletClientConfig 已经被设置。KubeletClient 用于 APIServer 与 Kubelet 通信
+	//（例如，执行 `kubectl exec`, `kubectl logs` 等）。如果它为空，APIServer 的很多功能将无法工作
 	if reflect.DeepEqual(c.Extra.KubeletClientConfig, kubeletclient.KubeletClientConfig{}) {
 		return nil, fmt.Errorf("Master.New() called with empty config.KubeletClientConfig")
 	}
-
+	// --- 2. 创建 ControlPlane APIServer ---
+	// `c.ControlPlane.New` 会创建一个 `ControlPlane` 对象，它本质上是一个 `genericapiserver`，
+	// 但已经预先配置了 `kube-apiserver` 所需的认证、授权、准入控制等通用组件。
 	cp, err := c.ControlPlane.New(controlplaneapiserver.KubeAPIServer, delegationTarget)
 	if err != nil {
 		return nil, err
 	}
+	// 创建 `kube-apiserver` 的主实例结构体。
 
 	s := &Instance{
 		ControlPlane: cp,
 	}
-
+	// --- 3. 创建客户端和存储提供者 ---
+	// 创建一个 Kubernetes 客户端，用于 `kube-apiserver` 内部的控制器与其他组件通信。
+	// `LoopbackClientConfig` 是一个特殊的配置，它允许服务器在不经过网络的情况下直接调用自己的 API
 	client, err := kubernetes.NewForConfig(c.ControlPlane.Generic.LoopbackClientConfig)
 	if err != nil {
 		return nil, err
 	}
-
+	// `c.StorageProviders` 会创建所有 Kubernetes 核心资源的 REST 存储后端 (`rest.Storage`)。
+	// 例如，它会为 Pods, Services, Deployments, ConfigMaps 等所有内置资源创建对应的 etcd 存储逻辑。
 	restStorageProviders, err := c.StorageProviders(client)
 	if err != nil {
 		return nil, err
 	}
-
+	// --- 4. 安装所有核心 API ---
+	// `s.ControlPlane.InstallAPIs` 是【核心步骤】。它会调用我们之前分析过的 `InstallLegacyAPIGroup` 和 `InstallAPIGroups`，
+	// 将所有核心 API 组（如 `/api/v1`）和命名 API 组（如 `/apis/apps/v1`, `/apis/batch/v1` 等）
+	// 安装到 `ControlPlane` 的 `genericapiserver` 中。
 	if err := s.ControlPlane.InstallAPIs(restStorageProviders...); err != nil {
 		return nil, err
 	}
+	// --- 5. 启动内置的、必不可少的控制器 ---
+	// `kube-apiserver` 内部也运行着一些非常基础和关键的控制器。
 
+	// --- 5a. Kubernetes Service Controller ---
+	// 这个控制器负责维护 `kubernetes.default.svc` 这个特殊的 Service。
+	// 这个 Service 提供了集群内部访问 API Server 的稳定入口。
 	_, publicServicePort, err := c.ControlPlane.Generic.SecureServing.HostPort()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get listener address: %w", err)
@@ -356,15 +376,20 @@ func (c CompletedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		PublicServicePort:         publicServicePort,
 		KubernetesServiceNodePort: c.Extra.KubernetesServiceNodePort,
 	}, client, c.ControlPlane.Extra.VersionedInformers.Core().V1().Services())
+	// 使用 PostStartHook 在服务器启动后启动这个控制器。
 	s.ControlPlane.GenericAPIServer.AddPostStartHookOrDie("bootstrap-controller", func(hookContext genericapiserver.PostStartHookContext) error {
 		kubernetesServiceCtrl.Start(hookContext.Done())
 		return nil
 	})
+	// 使用 PreShutdownHook 在服务器关闭前停止这个控制器。
+
 	s.ControlPlane.GenericAPIServer.AddPreShutdownHookOrDie("stop-kubernetes-service-controller", func() error {
 		kubernetesServiceCtrl.Stop()
 		return nil
 	})
-
+	// --- 5b. Service CIDR Controller (如果特性门控开启) ---
+	// 如果 `MultiCIDRServiceAllocator` 特性被启用，则启动一个控制器来管理 `ServiceCIDR` 对象。
+	// 这允许动态地为 Service 分配 ClusterIP。
 	if utilfeature.DefaultFeatureGate.Enabled(features.MultiCIDRServiceAllocator) {
 		s.ControlPlane.GenericAPIServer.AddPostStartHookOrDie("start-kubernetes-service-cidr-controller", func(hookContext genericapiserver.PostStartHookContext) error {
 			controller := defaultservicecidr.NewController(
@@ -374,6 +399,8 @@ func (c CompletedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 			)
 			// The default serviceCIDR must exist before the apiserver is healthy
 			// otherwise the allocators for Services will not work.
+			// 这个控制器必须在 APIServer 报告健康之前完成它的初始工作。
+
 			controller.Start(hookContext)
 			return nil
 		})

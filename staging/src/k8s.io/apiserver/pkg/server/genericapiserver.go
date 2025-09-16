@@ -819,14 +819,24 @@ func (s preparedGenericAPIServer) NonBlockingRunWithContext(ctx context.Context,
 }
 
 // installAPIResources is a private method for installing the REST storage backing each api groupversionresource
+// installAPIResources 负责安装一个 API 组中所有资源的 REST 端点。
+// `apiPrefix` 通常是 "/apis" 或 "/api"（用于遗留的核心 API）。
+// `apiGroupInfo` 包含了要安装的 API 组的完整定义。
+// `typeConverter` 用于 Server-Side Apply 的字段管理。
 func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *APIGroupInfo, typeConverter managedfields.TypeConverter) error {
+	// `resourceInfos` 用于收集所有已安装资源的信息，供后续的 StorageVersionManager 使用。
 	var resourceInfos []*storageversion.ResourceInfo
+	// 遍历这个 API 组中所有按优先级排序的版本（例如 v1, v1beta1）。
 	for _, groupVersion := range apiGroupInfo.PrioritizedVersions {
+		// 如果某个版本下没有任何资源被定义，就跳过它。
 		if len(apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version]) == 0 {
 			klog.Warningf("Skipping API %v because it has no resources.", groupVersion)
 			continue
 		}
-
+		// --- 1. 准备 APIGroupVersion 对象 ---
+		// `getAPIGroupVersion` 会创建一个 `APIGroupVersion` 对象。
+		// 这个对象是 `generic-go-restful` 库的核心，它知道如何根据 `rest.Storage`
+		// 为一个特定版本（如 apps/v1）的所有资源自动生成 REST 路由。
 		apiGroupVersion, err := s.getAPIGroupVersion(apiGroupInfo, groupVersion, apiPrefix)
 		if err != nil {
 			return err
@@ -836,16 +846,28 @@ func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *A
 		}
 		apiGroupVersion.TypeConverter = typeConverter
 		apiGroupVersion.MaxRequestBodyBytes = s.maxRequestBodyBytes
-
+		// --- 2. 安装 REST 路由 ---
+		// `apiGroupVersion.InstallREST` 是【最核心】的调用。
+		// 这个方法会：
+		// a. 遍历这个版本下的所有资源（如 "deployments", "replicasets"）。
+		// b. 为每个资源及其存储后端，自动生成标准的 RESTful 路由，例如：
+		//    - GET /apis/apps/v1/namespaces/{namespace}/deployments/{name}
+		//    - POST /apis/apps/v1/namespaces/{namespace}/deployments
+		//    - ... (LIST, WATCH, PUT, PATCH, DELETE 等)
+		// c. 将这些路由注册到 `s.Handler.GoRestfulContainer` 中，这是一个 go-restful 的路由容器。
+		// d. 返回为服务发现准备的资源列表 `discoveryAPIResources` 和供内部使用的 `resourceInfos`。
 		discoveryAPIResources, r, err := apiGroupVersion.InstallREST(s.Handler.GoRestfulContainer)
-
+		klog.V(4).Infof("discoveryAPIResources   %v: ", discoveryAPIResources)
 		if err != nil {
 			return fmt.Errorf("unable to setup API %v: %v", apiGroupInfo, err)
 		}
 		resourceInfos = append(resourceInfos, r...)
 
 		// Aggregated discovery only aggregates resources under /apis
-		if apiPrefix == APIGroupPrefix {
+		// --- 3. 更新服务发现信息 ---
+		// 将刚刚安装的资源列表添加到聚合的服务发现管理器中。
+		// 这使得 `/apis` 端点能够列出这个版本下有哪些资源。
+		if apiPrefix == APIGroupPrefix { // APIGroupPrefix 是 "/apis"
 			s.AggregatedDiscoveryGroupManager.AddGroupVersion(
 				groupVersion.Group,
 				apidiscoveryv2.APIVersionDiscovery{
@@ -867,9 +889,14 @@ func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *A
 		}
 
 	}
-
+	// --- 4. 注册资源销毁函数 ---
+	// 将 `apiGroupInfo` 中定义的存储销毁函数注册到服务器中。
+	// 当服务器关闭时，这个函数会被调用，以确保所有底层的存储资源（如 etcd 的 watcher）被正确关闭。
 	s.RegisterDestroyFunc(apiGroupInfo.destroyStorage)
-
+	// --- 5. 为 StorageVersion API 注册资源信息 ---
+	// `StorageVersion` 是一个用于平滑升级（storage migration）的 API。
+	// 如果这个特性被启用，我们需要将所有已安装资源的信息注册到 `StorageVersionManager` 中。
+	// 这样，`StorageVersionManager` 才能知道集群中有哪些资源，并管理它们的存储版本。
 	if s.FeatureGate.Enabled(features.StorageVersionAPI) &&
 		s.FeatureGate.Enabled(features.APIServerIdentity) {
 		// API installation happens before we start listening on the handlers,
@@ -884,25 +911,50 @@ func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *A
 // InstallLegacyAPIGroup exposes the given legacy api group in the API.
 // The <apiGroupInfo> passed into this function shouldn't be used elsewhere as the
 // underlying storage will be destroyed on this servers shutdown.
+// InstallLegacyAPIGroup 在 API 服务器中暴露给定的“遗留” API 组。
+// “遗留”在这里特指 Kubernetes 的核心 API 组（例如 "v1"），它没有组名，并且路径前缀是 `/api` 而不是 `/apis`。
+// 传入的 <apiGroupInfo> 不应在其他地方使用，因为其底层的存储将在服务器关闭时被销毁。
 func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo *APIGroupInfo) error {
+	// --- 1. 前置校验 ---
+	// 校验传入的 `apiPrefix` 是否是一个被允许的“遗留”前缀。
+	// 通常，这里只允许 `/api`。这可以防止错误地将一个普通 API 组安装为遗留组。
 	if !s.legacyAPIGroupPrefixes.Has(apiPrefix) {
 		return fmt.Errorf("%q is not in the allowed legacy API prefixes: %v", apiPrefix, s.legacyAPIGroupPrefixes.List())
 	}
 
+	// --- 2. 为 OpenAPI 生成模型 ---
+	// 这一步与 `InstallAPIGroups` 完全相同：为所有资源生成 OpenAPI 模型。
 	openAPIModels, err := s.getOpenAPIModels(apiPrefix, apiGroupInfo)
 	if err != nil {
 		return fmt.Errorf("unable to get openapi models: %v", err)
 	}
-
+	// --- 3. 安装所有资源的 REST API 端点 ---
+	// 复用 `installAPIResources` 函数来完成所有具体的 REST 路由安装。
+	// `apiPrefix` 在这里是 "/api"，所以生成的 URL 会是 `/api/v1/pods` 等。
 	if err := s.installAPIResources(apiPrefix, apiGroupInfo, openAPIModels); err != nil {
 		return err
 	}
 
 	// Install the version handler.
 	// Add a handler at /<apiPrefix> to enumerate the supported api versions.
+	// --- 4. 安装特殊的服务发现端点 (`/api`) ---
+	// 这是与 `InstallAPIGroups` 的【核心区别】。
+	// 普通 API 组的发现端点是 `/apis` 和 `/apis/<group>`。
+	// 遗留 API 组的根发现端点是 `/api`。
+
+	// 创建一个 `LegacyRootAPIHandler`，它专门用于处理对 `/api` 的请求。
+	// 这个处理器会返回一个 `APIVersions` 对象，其中只包含 `v1`。
 	legacyRootAPIHandler := discovery.NewLegacyRootAPIHandler(s.discoveryAddresses, s.Serializer, apiPrefix)
+	// `WrapAggregatedDiscoveryToHandler` 是一个适配器，它将新的 v2beta1 聚合发现服务
+	// 包装起来，使其能够与旧的 v1 发现处理器一起工作。
 	wrapped := discoveryendpoint.WrapAggregatedDiscoveryToHandler(legacyRootAPIHandler, s.AggregatedLegacyDiscoveryGroupManager)
+	// `GenerateWebService` 创建一个 `restful.WebService`，其根路径是 "/api"，
+	// 并将 `wrapped` 处理器注册到这个 WebService 中。
+	// 然后，将这个 WebService 添加到主路由容器。
 	s.Handler.GoRestfulContainer.Add(wrapped.GenerateWebService("/api", metav1.APIVersions{}))
+	// --- 5. 注册存储就绪性检查 ---
+	// 为核心 API 组注册健康检查，检查其 etcd 存储是否就绪。
+	// 第一个参数是组名，因为核心组没有组名，所以传入空字符串。
 	s.registerStorageReadinessCheck("", apiGroupInfo)
 
 	return nil
@@ -911,13 +963,20 @@ func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo 
 // InstallAPIGroups exposes given api groups in the API.
 // The <apiGroupInfos> passed into this function shouldn't be used elsewhere as the
 // underlying storage will be destroyed on this servers shutdown.
+// InstallAPIGroups 在 API 服务器中暴露给定的 API 组。
+// 传入的 <apiGroupInfos> 不应在其他地方使用，因为其底层的存储将在服务器关闭时被销毁。
 func (s *GenericAPIServer) InstallAPIGroups(apiGroupInfos ...*APIGroupInfo) error {
+	// --- 1. 前置校验 ---
+	// 在执行任何安装操作前，先对传入的 APIGroupInfo 进行基本校验。
 	for _, apiGroupInfo := range apiGroupInfos {
+		// 必须设置版本优先级。
 		if len(apiGroupInfo.PrioritizedVersions) == 0 {
 			return fmt.Errorf("no version priority set for %#v", *apiGroupInfo)
 		}
 		// Do not register empty group or empty version.  Doing so claims /apis/ for the wrong entity to be returned.
 		// Catching these here places the error  much closer to its origin
+		// 禁止注册空的 Group 或 Version，因为这会错误地抢占根路径 `/apis/`。
+		// 在这里捕获这些错误，能让问题更接近其源头。
 		if len(apiGroupInfo.PrioritizedVersions[0].Group) == 0 {
 			return fmt.Errorf("cannot register handler with an empty group for %#v", *apiGroupInfo)
 		}
@@ -925,13 +984,21 @@ func (s *GenericAPIServer) InstallAPIGroups(apiGroupInfos ...*APIGroupInfo) erro
 			return fmt.Errorf("cannot register handler with an empty version for %#v", *apiGroupInfo)
 		}
 	}
-
+	// --- 2. 为 OpenAPI 生成模型 ---
+	// `getOpenAPIModels` 会遍历所有 API 组中的所有资源，
+	// 并为它们生成 OpenAPI v2 规范所需的模型定义。
 	openAPIModels, err := s.getOpenAPIModels(APIGroupPrefix, apiGroupInfos...)
 	if err != nil {
 		return fmt.Errorf("unable to get openapi models: %v", err)
 	}
+	// --- 3. 循环安装每个 API 组 ---
 
 	for _, apiGroupInfo := range apiGroupInfos {
+		// --- 3a. 安装所有资源的 REST API 端点 ---
+		// `installAPIResources` 是实际安装 REST 端点的地方。
+		// 它会为每个资源（如 "pods", "deployments"）及其子资源（如 "pods/status"）
+		// 创建对应的 GET, LIST, WATCH, POST, PUT, DELETE 等 HTTP 路由，
+		// 并将这些路由与相应的存储后端（rest.Storage）关联起来。
 		if err := s.installAPIResources(APIGroupPrefix, apiGroupInfo, openAPIModels); err != nil {
 			return fmt.Errorf("unable to install api resources: %v", err)
 		}
@@ -939,9 +1006,12 @@ func (s *GenericAPIServer) InstallAPIGroups(apiGroupInfos ...*APIGroupInfo) erro
 		// setup discovery
 		// Install the version handler.
 		// Add a handler at /apis/<groupName> to enumerate all versions supported by this group.
+		// --- 3b. 设置服务发现 (Discovery) ---
+		// 这部分负责安装 `/apis/<groupName>` 和 `/apis/<groupName>/<version>` 这类服务发现端点。
 		apiVersionsForDiscovery := []metav1.GroupVersionForDiscovery{}
 		for _, groupVersion := range apiGroupInfo.PrioritizedVersions {
 			// Check the config to make sure that we elide versions that don't have any resources
+			// 检查配置，确保我们不会为一个没有任何资源被启用的版本生成服务发现信息。
 			if len(apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version]) == 0 {
 				continue
 			}
@@ -954,14 +1024,20 @@ func (s *GenericAPIServer) InstallAPIGroups(apiGroupInfos ...*APIGroupInfo) erro
 			GroupVersion: apiGroupInfo.PrioritizedVersions[0].String(),
 			Version:      apiGroupInfo.PrioritizedVersions[0].Version,
 		}
+		// 构建一个 `metav1.APIGroup` 对象，它描述了这个 API 组的所有版本信息。
 		apiGroup := metav1.APIGroup{
 			Name:             apiGroupInfo.PrioritizedVersions[0].Group,
 			Versions:         apiVersionsForDiscovery,
 			PreferredVersion: preferredVersionForDiscovery,
 		}
-
+		// 将这个 APIGroup 添加到服务器的 `DiscoveryGroupManager` 中，
+		// 这样 `/apis` 端点就能正确地列出这个组。
 		s.DiscoveryGroupManager.AddGroup(apiGroup)
+		// 创建并注册一个 HTTP 处理器，用于响应该 API 组的发现请求（即 `/apis/<groupName>`）。
+		// 当客户端访问这个路径时，它会返回上面构建的 `apiGroup` 对象。
 		s.Handler.GoRestfulContainer.Add(discovery.NewAPIGroupHandler(s.Serializer, apiGroup).WebService())
+		// --- 3c. 注册存储就绪性检查 ---
+		// 为这个 API 组注册一个健康检查，用于检查其底层的存储（etcd）是否准备就绪。
 		s.registerStorageReadinessCheck(apiGroupInfo.PrioritizedVersions[0].Group, apiGroupInfo)
 	}
 	return nil
