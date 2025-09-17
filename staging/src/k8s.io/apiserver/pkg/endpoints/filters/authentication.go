@@ -47,6 +47,17 @@ func WithAuthentication(handler http.Handler, auth authenticator.Request, failed
 	return withAuthentication(handler, auth, failed, apiAuds, requestHeaderConfig, recordAuthenticationMetrics)
 }
 
+// WithAuthentication 是一个 HTTP 中间件（处理器），它使用配置的认证器对请求进行认证，
+// 并在请求的上下文中填充认证后的用户信息。
+//
+// 参数:
+//
+//	handler: http.Handler - 如果认证成功，请求将被传递给这个内层处理器。
+//	auth: authenticator.Request - 认证器接口，是真正执行认证逻辑的核心。
+//	failed: http.Handler - 如果认证失败，请求将被传递给这个处理器（通常返回 401 Unauthorized）。
+//	apiAuds: authenticator.Audiences - API Server 期望的受众（Audiences），用于验证 Token 的适用范围。
+//	requestHeaderConfig: *authenticatorfactory.RequestHeaderConfig - 自定义的代理头配置。
+//	sharedInformers: informers.SharedInformerFactory - 共享的 Informer 工厂，某些认证器可能需要。
 func withAuthentication(handler http.Handler, auth authenticator.Request, failed http.Handler, apiAuds authenticator.Audiences, requestHeaderConfig *authenticatorfactory.RequestHeaderConfig, metrics authenticationRecordMetricsFunc) http.Handler {
 	if auth == nil {
 		klog.Warning("Authentication is disabled")
@@ -58,6 +69,8 @@ func withAuthentication(handler http.Handler, auth authenticator.Request, failed
 		GroupHeaders:        headerrequest.StaticStringSlice{"X-Remote-Group"},
 		ExtraHeaderPrefixes: headerrequest.StaticStringSlice{"X-Remote-Extra-"},
 	}
+	// 返回一个新的 http.HandlerFunc，这就是中间件的核心实现。
+	// 所有到达的请求都会被这个函数处理。
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		authenticationStart := time.Now()
 
