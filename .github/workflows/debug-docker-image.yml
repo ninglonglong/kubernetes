@@ -68,7 +68,8 @@ jobs:
           
           # 动态创建一个 Dockerfile 用于构建调试镜像
           cat <<EOF > ./_output/Dockerfile.debug
-          FROM debian:bullseye-slim
+          FROM ubuntu:22.04
+          
           
           # 将带调试信息的组件二进制文件和 dlv 复制到镜像中
           COPY ./${COMPONENT_NAME}-debug /usr/local/bin/${COMPONENT_NAME}
