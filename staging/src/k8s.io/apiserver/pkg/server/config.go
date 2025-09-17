@@ -1092,6 +1092,7 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	// 在进入此处理器之前，请求必须已经通过了认证、审计等更外层的处理器。
 	// 这个处理器检查已认证的用户是否有权限执行当前请求的操作。
 	// TrackCompleted 标记此阶段的结束，用于延迟跟踪。
+
 	klog.V(4).Infof("TrackCompleted 标记此阶段的结束，用于延迟跟踪。")
 	handler = filterlatency.TrackCompleted(handler)
 	// WithAuthorization 是授权的核心，如果授权失败，它将终止请求并返回 403 Forbidden。
@@ -1216,6 +1217,10 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	}
 	// 在请求完成时，打印一条详细的 HTTP 日志。这是我们在日志里最常见到的那一行。
 	handler = genericfilters.WithHTTPLogging(handler)
+	klog.V(4).Infof("WithHTTPLogging。")
+	print("WithHTTPLogging。")
+	klog.Info("kl - WithHTTPLogging")
+
 	// 另一个与延迟跟踪相关的包裹。
 	handler = genericapifilters.WithLatencyTrackers(handler)
 	// WithRoutine will execute future handlers in a separate goroutine and serving
