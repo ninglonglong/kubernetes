@@ -297,28 +297,40 @@ func (o *Options) Validate() []error {
 
 // Config return a scheduler config object
 func (o *Options) Config(ctx context.Context) (*schedulerappconfig.Config, error) {
+
 	logger := klog.FromContext(ctx)
 	if o.SecureServing != nil {
 		if err := o.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{netutils.ParseIPSloppy("127.0.0.1")}); err != nil {
 			return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
 		}
 	}
-
+	// 创建一个空的 Config 对象。这个对象将作为最终的“施工方案”。
 	c := &schedulerappconfig.Config{}
+	// 将 Options 对象 (o) 中的配置应用到 Config 对象 (c) 中。
+	// 这通常是一个简单的字段拷贝或转换过程，把命令行解析出的值赋给 Config 对象的相应字段。
 	if err := o.ApplyTo(logger, c); err != nil {
 		return nil, err
 	}
 
 	// Prepare kube clients.
+	// --- 接下来的步骤是基于已应用的配置，创建更复杂的运行时对象 ---
+
+	// 准备 Kubernetes 客户端。
+	// createClients 函数会根据 KubeConfig（通常来自 --kubeconfig 参数或 in-cluster 配置）
+	// 创建用于与 apiserver 通信的客户端。
+	// `client` 用于常规的 API 操作（如 GET, LIST, UPDATE Pods/Nodes）。
+	// `eventClient` 专门用于发送事件。
 	client, eventClient, err := createClients(c.KubeConfig)
 	if err != nil {
 		return nil, err
 	}
-
+	// 创建一个事件广播器。scheduler 在运行过程中会产生各种事件（如 "Successfully assigned pod to node"），
+	// 这个广播器负责将这些事件通过 `eventClient` 发送给 apiserver。
 	c.EventBroadcaster = events.NewEventBroadcasterAdapterWithContext(ctx, eventClient)
 
 	// Set up leader election if enabled.
 	var leaderElectionConfig *leaderelection.LeaderElectionConfig
+	// 如果启用了 Leader Election（领导者选举），则设置相关配置。
 	if c.ComponentConfig.LeaderElection.LeaderElect {
 		// Use the scheduler name in the first profile to record leader election.
 		schedulerName := corev1.DefaultSchedulerName
@@ -331,13 +343,25 @@ func (o *Options) Config(ctx context.Context) (*schedulerappconfig.Config, error
 			return nil, err
 		}
 	}
+	// --- 将所有创建好的运行时对象填充到 Config 对象中 ---
 
+	// 将创建好的 clientset 赋给 Config。
 	c.Client = client
+	// 创建一个标准的 Informer 工厂。
+	// 这个工厂将用于创建 Watch Pods, Nodes, Services 等标准 Kubernetes 资源的 Informer。
+	// `0` 表示默认的 resync period。
 	c.InformerFactory = scheduler.NewInformerFactory(client, 0)
+	// 创建一个动态客户端 (dynamic client)。
+	// 动态客户端可以操作任何类型的资源，包括 CRD，而不需要预先生成类型化的客户端代码。
 	dynClient := dynamic.NewForConfigOrDie(c.KubeConfig)
+	// 创建一个动态 Informer 工厂。
+	// 这个工厂用于创建 Watch CRD 等非标准资源的 Informer。
 	c.DynInformerFactory = dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynClient, 0, corev1.NamespaceAll, nil)
+	// 将创建好的 Leader Election 配置赋给 Config。
 	c.LeaderElection = leaderElectionConfig
+	// 将全局的组件注册表（包含特性门控等信息）赋给 Config。
 	c.ComponentGlobalsRegistry = o.ComponentGlobalsRegistry
+	// 返回填充完毕、准备就绪的 Config 对象。
 
 	return c, nil
 }

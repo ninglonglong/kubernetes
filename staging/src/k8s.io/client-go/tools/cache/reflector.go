@@ -83,45 +83,88 @@ type TransformingStore interface {
 }
 
 // Reflector watches a specified resource and causes all changes to be reflected in the given store.
+// Reflector 监视指定的资源，并将其所有变更反映（同步）到给定的 store 中。
+// 它是 Kubernetes Informer 机制的核心组件，负责连接 apiserver 和本地缓存（store）。
 type Reflector struct {
 	// name identifies this reflector. By default, it will be a file:line if possible.
+	// name 用于标识此 Reflector 的名称。默认情况下，如果可能，它会是代码中的文件名和行号。
+	// 主要用于日志和调试。
 	name string
 	// The name of the type we expect to place in the store. The name
 	// will be the stringification of expectedGVK if provided, and the
 	// stringification of expectedType otherwise. It is for display
 	// only, and should not be used for parsing or comparison.
+	// typeDescription 是我们期望放入 store 中的对象类型的描述性名称。
+	// 如果提供了 expectedGVK，它就是 GVK 的字符串形式；否则就是 expectedType 的字符串形式。
+	// 这个字段仅用于显示（例如，在日志中），不应用于解析或比较。
 	typeDescription string
 	// An example object of the type we expect to place in the store.
 	// Only the type needs to be right, except that when that is
 	// `unstructured.Unstructured` the object's `"apiVersion"` and
 	// `"kind"` must also be right.
+	// expectedType 是我们期望放入 store 中的对象的 Go 类型（通过反射获取）。
+	// 只需要类型是正确的即可。但当类型是 `unstructured.Unstructured` 时，
+	// 对象的 "apiVersion" 和 "kind" 字段也必须正确设置。
 	expectedType reflect.Type
 	// The GVK of the object we expect to place in the store if unstructured.
+	// expectedGVK 是期望放入 store 的对象的 GroupVersionKind (GVK)。
+	// 这在处理 `unstructured.Unstructured` 类型的对象时特别有用，因为它明确了对象的 API 组、版本和类型。
 	expectedGVK *schema.GroupVersionKind
 	// The destination to sync up with the watch source
+	// store 是目标存储，用于同步来自 watch 源的数据。
+	// 通常是一个本地的、线程安全的缓存（如 `cache.Store`）。
+	//Reflector 会将从 apiserver 获取的所有对象变更反映到这个 store 中。
 	store ReflectorStore
 	// listerWatcher is used to perform lists and watches.
+	// listerWatcher 用于执行 List 和 Watch 操作的接口。
+	// 它定义了如何从 apiserver 列出（List）所有资源和监视（Watch）资源变更。
 	listerWatcher ListerWatcherWithContext
 	// backoff manages backoff of ListWatch
+	// backoffManager 退避管理器，用于在 List/Watch
+	//操作失败时进行指数退避重试，以避免因频繁重试而冲击 apiserver。
 	backoffManager wait.BackoffManager
-	resyncPeriod   time.Duration
+	// resyncPeriod 重新同步周期。Reflector 会以这个周期定期地
+	// 重新列出（List）所有资源，并将它们放入工作队列，
+	// 即使资源没有发生任何变化。这确保了本地缓存与
+	// apiserver 的最终一致性，并能处理可能丢失的事件。
+	// 如果设置为 0，则禁用定期的全量 Resync。
+	resyncPeriod time.Duration
 	// minWatchTimeout defines the minimum timeout for watch requests.
+	// minWatchTimeout 定义了 Watch 请求的最小超时时间。
+	// Kubernetes apiserver 会为 watch 请求设置一个随机的超时时间，
+	// 此字段确保超时时间不会低于一个最小值，以减少频繁地重建 watch 连接。
 	minWatchTimeout time.Duration
 	// clock allows tests to manipulate time
+	// clock 时钟接口，主要用于测试。在测试中，可以通过
+	//mock clock 来控制时间，而不需要真实地等待。
 	clock clock.Clock
 	// paginatedResult defines whether pagination should be forced for list calls.
 	// It is set based on the result of the initial list call.
+	// paginatedResult 一个内部标志，指示 List 调用是否应该强制分页。
+	// 它的值是根据初始 List 调用的结果来设置的。
 	paginatedResult bool
 	// lastSyncResourceVersion is the resource version token last
 	// observed when doing a sync with the underlying store
 	// it is thread safe, but not synchronized with the underlying store
+	// lastSyncResourceVersion 是最后一次同步的资源版本号 (Resource Version)。
+	// 这是 Reflector 从 apiserver 观察到的最新的资源版本。在重建 watch 连接时，
+	// Reflector 会从这个版本号开始，从而避免接收重复的事件。
 	lastSyncResourceVersion string
 	// isLastSyncResourceVersionUnavailable is true if the previous list or watch request with
 	// lastSyncResourceVersion failed with an "expired" or "too large resource version" error.
+	// isLastSyncResourceVersionUnavailable 是一个标志，指示上一次的 resource version 是否已不可用。
+	// 如果上一次使用 `lastSyncResourceVersion` 的 List 或 Watch 请求因为“版本号已过期”
+	// (expired) 或“版本号过大”而失败，此字段会设为 true。
+	// 这时 Reflector 需要执行一次全量 List 来重新同步。
 	isLastSyncResourceVersionUnavailable bool
 	// lastSyncResourceVersionMutex guards read/write access to lastSyncResourceVersion
+
+	// lastSyncResourceVersionMutex 用于保护对
+	// `lastSyncResourceVersion` 字段读写访问的互斥锁，确保线程安全。
 	lastSyncResourceVersionMutex sync.RWMutex
+
 	// Called whenever the ListAndWatch drops the connection with an error.
+	// watchErrorHandler 当 `ListAndWatch` 因错误断开连接时调用的错误处理函数。
 	watchErrorHandler WatchErrorHandlerWithContext
 	// WatchListPageSize is the requested chunk size of initial and resync watch lists.
 	// If unset, for consistent reads (RV="") or reads that opt-into arbitrarily old data
@@ -130,10 +173,22 @@ type Reflector struct {
 	// NOTE: It should be used carefully as paginated lists are always served directly from
 	// etcd, which is significantly less efficient and may lead to serious performance and
 	// scalability problems.
+
+	// WatchListPageSize 是初始 List 和 Resync List 的分块大小（即每页获取的对象数量）。
+	// 如果未设置：
+	// - 对于需要一致性读（RV=""）或可以接受任意旧数据（RV="0"）的请求，会使用默认的分页大小。
+	// - 对于其他情况（RV不为空且不为"0"），会禁用分页，以便能从 apiserver 的 watch cache 中获取数据。
+	// 注意：需要谨慎使用此字段，因为分页的 List 请求总是直接从 etcd 读取数据，
+	// 效率远低于从 apiserver 的 watch cache 读取，
+	// 可能导致严重的性能和可伸缩性问题。
 	WatchListPageSize int64
 	// ShouldResync is invoked periodically and whenever it returns `true` the Store's Resync operation is invoked
+
+	// ShouldResync 是一个函数，会被定期调用，当它返回 `true` 时，会触发 Store 的 `Resync` 操作。
+	// 它提供了比固定的 `resyncPeriod` 更灵活的控制，可以根据自定义逻辑决定是否需要触发一次全量同步。
 	ShouldResync func() bool
 	// MaxInternalErrorRetryDuration defines how long we should retry internal errors returned by watch.
+	// MaxInternalErrorRetryDuration 定义了对于 watch 返回的内部错误（internal errors）应该重试多长时间。
 	MaxInternalErrorRetryDuration time.Duration
 	// useWatchList if turned on instructs the reflector to open a stream to bring data from the API server.
 	// Streaming has the primary advantage of using fewer server's resources to fetch data.
@@ -143,6 +198,12 @@ type Reflector struct {
 	// might result in an increased memory consumption of the APIServer.
 	//
 	// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/3157-watch-list#design-details
+	// useWatchList 如果开启，此标志指示 reflector 通过一个流式（streaming）连接从 API服务器获取数据。
+	// 这种流式 List（也称为 Watch List）的主要优点是使用更少的服务器资源来获取数据。
+	//
+	// 旧的行为是建立一个 LIST 请求，然后分块获取数据。分页的 List 效率较低，并可能增加 APIServer 的内存消耗。
+	//
+	// 此特性是基于 KEP-3157 实现的，详见：https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/3157-watch-list#design-details
 	useWatchList bool
 }
 

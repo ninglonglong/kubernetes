@@ -55,11 +55,18 @@ func NewPodInformer(client kubernetes.Interface, namespace string, resyncPeriod 
 // NewFilteredPodInformer constructs a new informer for Pod type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// NewFilteredPodInformer 创建一个可以过滤 Pod 的 SharedIndexInformer。
+// 它接受一个 client, namespace, resyncPeriod, indexers,
+// 以及一个关键的 tweakListOptions 函数。
 func NewFilteredPodInformer(client kubernetes.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
 	return cache.NewSharedIndexInformer(
 		&cache.ListWatch{
+			// ListFunc 定义了如何执行“List”操作。
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				// 在真正调用 API 之前，先检查 tweakListOptions 是否存在。
 				if tweakListOptions != nil {
+					// 如果存在，就调用它，把当前的 ListOptions 传进去，让它有机会修改。
+					// 比如，在这里加上 fieldSelector。
 					tweakListOptions(&options)
 				}
 				return client.CoreV1().Pods(namespace).List(context.Background(), options)

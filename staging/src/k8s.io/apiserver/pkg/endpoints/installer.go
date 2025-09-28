@@ -333,92 +333,108 @@ func GetResourceKind(groupVersion schema.GroupVersion, storage rest.Storage, typ
 	return fqKindToRegister, nil
 }
 
+// registerResourceHandlers 负责为一个资源（如 Pods）注册其所有支持的 RESTful HTTP 端点。
+// path: 资源的路径，例如 "pods" 或 "nodes/{name}/status"。
+// storage: 实现了资源增删改查逻辑的存储后端接口。
+// ws: go-restful 框架的 WebService 对象，所有新创建的路由都会被添加到这里。
+// 它返回 APIResource 元数据（用于服务发现）、资源信息和可能出现的错误
 func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storage, ws *restful.WebService) (*metav1.APIResource, *storageversion.ResourceInfo, error) {
+	// admit 是一个准入控制器链，用于在创建或更新资源时进行校验。
 	admit := a.group.Admit
-
+	// 确定用于处理 options 对象的 API 版本（如 CreateOptions, ListOptions）。
+	// 通常与资源本身的版本相同，但可以被覆盖。
 	optionsExternalVersion := a.group.GroupVersion
 	if a.group.OptionsExternalVersion != nil {
 		optionsExternalVersion = *a.group.OptionsExternalVersion
 	}
-
+	// 将路径分割成主资源和子资源。例如 "nodes/{name}/status" 会被分割成 resource="nodes" 和 subresource="status"。
 	resource, subresource, err := splitSubresource(path)
 	if err != nil {
 		return nil, nil, err
 	}
-
+	// 获取当前处理的 API 组和版本，例如 "v1" 或 "apps/v1"。
 	group, version := a.group.GroupVersion.Group, a.group.GroupVersion.Version
-
+	// 获取 storage 对象所代表的资源的确切 GroupVersionKind（GVK）。
 	fqKindToRegister, err := GetResourceKind(a.group.GroupVersion, storage, a.group.Typer)
 	if err != nil {
 		return nil, nil, err
 	}
-
+	// 使用 Creater 创建一个该资源类型的空对象实例（例如，一个空的 v1.Pod 对象）。
+	// 这在序列化/反序列化和生成文档时非常有用。
 	versionedPtr, err := a.group.Creater.New(fqKindToRegister)
 	if err != nil {
 		return nil, nil, err
 	}
-	defaultVersionedObject := indirectArbitraryPointer(versionedPtr)
-	kind := fqKindToRegister.Kind
-	isSubresource := len(subresource) > 0
+	defaultVersionedObject := indirectArbitraryPointer(versionedPtr) // 获取指针指向的实际对象。
+	kind := fqKindToRegister.Kind                                    // 从 GVK 中提取 Kind，例如 "Pod"。
+	isSubresource := len(subresource) > 0                            // 判断当前路径是否是子资源。
 
 	// If there is a subresource, namespace scoping is defined by the parent resource
+	// --- 确定资源是否是命名空间作用域的 ---
 	var namespaceScoped bool
 	if isSubresource {
+		// 如果是子资源，它的作用域由其父资源决定。
+		// 例如，Pod 是命名空间的，那么 Pod 的 status 子资源也必须是命名空间的。
 		parentStorage, ok := a.group.Storage[resource]
 		if !ok {
 			return nil, nil, fmt.Errorf("missing parent storage: %q", resource)
 		}
-		scoper, ok := parentStorage.(rest.Scoper)
+		scoper, ok := parentStorage.(rest.Scoper) // 检查父资源是否实现了 Scoper 接口。
 		if !ok {
 			return nil, nil, fmt.Errorf("%q must implement scoper", resource)
 		}
-		namespaceScoped = scoper.NamespaceScoped()
+		namespaceScoped = scoper.NamespaceScoped() // 获取父资源的作用域。
 
 	} else {
+		// 如果是主资源，直接检查它自己是否实现了 Scoper 接口。
 		scoper, ok := storage.(rest.Scoper)
 		if !ok {
 			return nil, nil, fmt.Errorf("%q must implement scoper", resource)
 		}
 		namespaceScoped = scoper.NamespaceScoped()
 	}
-
+	// --- 核心部分：通过接口断言，检查 storage 对象实现了哪些 REST 行为（Verbs） ---
+	// 这是一个非常经典的 Go 语言接口驱动设计的例子。
+	// 每个变量（如 isCreater, isLister）都是一个布尔值，代表该 storage 是否支持对应的操作。
 	// what verbs are supported by the storage, used to know what verbs we support per path
-	creater, isCreater := storage.(rest.Creater)
-	namedCreater, isNamedCreater := storage.(rest.NamedCreater)
-	lister, isLister := storage.(rest.Lister)
-	getter, isGetter := storage.(rest.Getter)
-	getterWithOptions, isGetterWithOptions := storage.(rest.GetterWithOptions)
-	gracefulDeleter, isGracefulDeleter := storage.(rest.GracefulDeleter)
-	collectionDeleter, isCollectionDeleter := storage.(rest.CollectionDeleter)
-	updater, isUpdater := storage.(rest.Updater)
-	patcher, isPatcher := storage.(rest.Patcher)
-	watcher, isWatcher := storage.(rest.Watcher)
-	connecter, isConnecter := storage.(rest.Connecter)
+	creater, isCreater := storage.(rest.Creater)                               // 创建新资源 (POST)
+	namedCreater, isNamedCreater := storage.(rest.NamedCreater)                // 创建带名字的资源 (通常不用于 REST)
+	lister, isLister := storage.(rest.Lister)                                  // 列出资源集合 (GET /pods)
+	getter, isGetter := storage.(rest.Getter)                                  // 获取单个资源 (GET /pods/{name})
+	getterWithOptions, isGetterWithOptions := storage.(rest.GetterWithOptions) // 支持带选项的 Get
+	gracefulDeleter, isGracefulDeleter := storage.(rest.GracefulDeleter)       // 优雅删除单个资源 (DELETE /pods/{name})
+	collectionDeleter, isCollectionDeleter := storage.(rest.CollectionDeleter) // 删除资源集合 (DELETE /pods)
+	updater, isUpdater := storage.(rest.Updater)                               // 更新资源 (PUT /pods/{name})
+	patcher, isPatcher := storage.(rest.Patcher)                               // 部分更新资源 (PATCH /pods/{name})
+	watcher, isWatcher := storage.(rest.Watcher)                               // 监控资源变化 (GET /pods?watch=true)
+	connecter, isConnecter := storage.(rest.Connecter)                         // 用于 exec, proxy, port-forward 等长连接
 	storageMeta, isMetadata := storage.(rest.StorageMetadata)
 	storageVersionProvider, isStorageVersionProvider := storage.(rest.StorageVersionProvider)
 	gvAcceptor, _ := storage.(rest.GroupVersionAcceptor)
 	if !isMetadata {
-		storageMeta = defaultStorageMetadata{}
+		storageMeta = defaultStorageMetadata{} // 如果没实现，使用默认的元数据。
 	}
 
 	if isNamedCreater {
-		isCreater = true
+		isCreater = true // NamedCreater 也算是一种 Creater。
 	}
-
+	// --- 为各种操作准备版本化的辅助对象实例 ---
+	// 这些空对象用于 API 文档生成（Swagger/OpenAPI）和请求体的反序列化。
 	var versionedList interface{}
 	if isLister {
-		list := lister.NewList()
-		listGVKs, _, err := a.group.Typer.ObjectKinds(list)
+		list := lister.NewList()                            // 获取一个空的 List 对象（如 v1.PodList）
+		listGVKs, _, err := a.group.Typer.ObjectKinds(list) // 获取 List 对象的 GVK
 		if err != nil {
 			return nil, nil, err
 		}
+		// 创建一个特定版本的 List 对象实例。
 		versionedListPtr, err := a.group.Creater.New(a.group.GroupVersion.WithKind(listGVKs[0].Kind))
 		if err != nil {
 			return nil, nil, err
 		}
 		versionedList = indirectArbitraryPointer(versionedListPtr)
 	}
-
+	// 为各种 Options（如 ListOptions, CreateOptions）创建版本化的空对象实例。
 	versionedListOptions, err := a.group.Creater.New(optionsExternalVersion.WithKind("ListOptions"))
 	if err != nil {
 		return nil, nil, err
@@ -440,6 +456,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 	var versionedDeleterObject interface{}
 	deleteReturnsDeletedObject := false
 	if isGracefulDeleter {
+		// 创建版本化的 Status 对象实例，用于标准的 API 响应。
 		versionedDeleteOptions, err = a.group.Creater.New(optionsExternalVersion.WithKind("DeleteOptions"))
 		if err != nil {
 			return nil, nil, err
@@ -456,6 +473,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 		return nil, nil, err
 	}
 	versionedStatus := indirectArbitraryPointer(versionedStatusPtr)
+	// --- 处理支持特殊选项的 GET 请求 ---
 	var (
 		getOptions             runtime.Object
 		versionedGetOptions    runtime.Object
@@ -463,12 +481,13 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 		getSubpath             bool
 	)
 	if isGetterWithOptions {
-		getOptions, getSubpath, _ = getterWithOptions.NewGetOptions()
+		getOptions, getSubpath, _ = getterWithOptions.NewGetOptions() // 获取 Get 操作支持的选项对象。
 		getOptionsInternalKinds, _, err := a.group.Typer.ObjectKinds(getOptions)
 		if err != nil {
 			return nil, nil, err
 		}
 		getOptionsInternalKind = getOptionsInternalKinds[0]
+		// 创建版本化的 GetOptions 对象。
 		versionedGetOptions, err = a.group.Creater.New(a.group.GroupVersion.WithKind(getOptionsInternalKind.Kind))
 		if err != nil {
 			versionedGetOptions, err = a.group.Creater.New(optionsExternalVersion.WithKind(getOptionsInternalKind.Kind))
@@ -476,9 +495,9 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 				return nil, nil, err
 			}
 		}
-		isGetter = true
+		isGetter = true // 如果支持 GetterWithOptions，那么它肯定也支持普通的 Get。
 	}
-
+	// 为 Watch 操作创建版本化的 WatchEvent 对象。
 	var versionedWatchEvent interface{}
 	if isWatcher {
 		versionedWatchEventPtr, err := a.group.Creater.New(a.group.GroupVersion.WithKind("WatchEvent"))
@@ -487,7 +506,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 		}
 		versionedWatchEvent = indirectArbitraryPointer(versionedWatchEventPtr)
 	}
-
+	// --- 处理 Connect 请求 (如 exec, attach) ---
 	var (
 		connectOptions             runtime.Object
 		versionedConnectOptions    runtime.Object
@@ -495,7 +514,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 		connectSubpath             bool
 	)
 	if isConnecter {
-		connectOptions, connectSubpath, _ = connecter.NewConnectOptions()
+		connectOptions, connectSubpath, _ = connecter.NewConnectOptions() // 获取 Connect 操作支持的选项对象。
 		if connectOptions != nil {
 			connectOptionsInternalKinds, _, err := a.group.Typer.ObjectKinds(connectOptions)
 			if err != nil {
@@ -503,6 +522,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 			}
 
 			connectOptionsInternalKind = connectOptionsInternalKinds[0]
+			// 创建版本化的 ConnectOptions 对象。
 			versionedConnectOptions, err = a.group.Creater.New(a.group.GroupVersion.WithKind(connectOptionsInternalKind.Kind))
 			if err != nil {
 				versionedConnectOptions, err = a.group.Creater.New(optionsExternalVersion.WithKind(connectOptionsInternalKind.Kind))
@@ -512,29 +532,33 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 			}
 		}
 	}
-
+	// 只有当一个资源同时支持 List 和 Watch 时，才允许对列表进行 watch（即 /api/v1/pods?watch=true）。
 	allowWatchList := isWatcher && isLister // watching on lists is allowed only for kinds that support both watch and list.
+	// 定义通用的路径参数，用于 API 文档。
 	nameParam := ws.PathParameter("name", "name of the "+kind).DataType("string")
 	pathParam := ws.PathParameter("path", "path to the resource").DataType("string")
 
 	params := []*restful.Parameter{}
-	actions := []action{}
+	actions := []action{} // actions 列表将收集所有注册的路由及其处理函数。
 
 	var resourceKind string
 	kindProvider, ok := storage.(rest.KindProvider)
 	if ok {
 		resourceKind = kindProvider.Kind()
 	} else {
-		resourceKind = kind
+		resourceKind = kind // 默认使用从 GVK 中获取的 Kind。
 	}
-
+	// 检查资源是否支持以表格形式输出 (kubectl get ... -o wide)。
 	tableProvider, isTableProvider := storage.(rest.TableConvertor)
 	if isLister && !isTableProvider {
 		// All listers must implement TableProvider
+		// 这是一个强制要求：所有支持 List 的资源都必须实现 TableConvertor。
 		return nil, nil, fmt.Errorf("%q must implement TableConvertor", resource)
 	}
 
 	var apiResource metav1.APIResource
+	// 如果启用了 StorageVersionHash 特性门控，并且资源提供了存储版本信息，
+	// 则计算并记录其存储版本的哈希值。这用于服务发现和缓存验证。
 	if utilfeature.DefaultFeatureGate.Enabled(features.StorageVersionHash) &&
 		isStorageVersionProvider &&
 		storageVersionProvider.StorageVersion() != nil {
@@ -548,13 +572,17 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 
 	// Get the list of actions for the given scope.
 	switch {
+	// --- Case 1: 处理非命名空间作用域的资源（集群级资源，如 Nodes, PersistentVolumes） ---
 	case !namespaceScoped:
 		// Handle non-namespace scoped resources like nodes.
+		// resourcePath 是指资源集合的路径，例如 "nodes"。
 		resourcePath := resource
 		resourceParams := params
+		// itemPath 是指单个资源的路径，例如 "nodes/{name}"。
 		itemPath := resourcePath + "/{name}"
-		nameParams := append(params, nameParam)
-		proxyParams := append(nameParams, pathParam)
+		nameParams := append(params, nameParam)      // 包含 {name} 参数的参数列表。
+		proxyParams := append(nameParams, pathParam) // 用于代理请求，包含 {name} 和 {path}。
+		// 如果是子资源，路径会更长，例如 "nodes/{name}/status"。
 		suffix := ""
 		if isSubresource {
 			suffix = "/" + subresource
@@ -562,9 +590,11 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 			resourcePath = itemPath
 			resourceParams = nameParams
 		}
+		// 填充用于服务发现的 APIResource 结构体。
 		apiResource.Name = path
-		apiResource.Namespaced = false
+		apiResource.Namespaced = false // 明确指出这是集群级资源。
 		apiResource.Kind = resourceKind
+		// 创建一个用于生成资源名称的辅助对象，指定为集群作用域。
 		namer := handlers.ContextBasedNaming{
 			Namer:         a.group.Namer,
 			ClusterScoped: true,
@@ -572,31 +602,42 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 
 		// Handler for standard REST verbs (GET, PUT, POST and DELETE).
 		// Add actions at the resource path: /api/apiVersion/resource
-		actions = appendIf(actions, action{request.MethodList, resourcePath, resourceParams, namer, false}, isLister)
-		actions = appendIf(actions, action{request.MethodPost, resourcePath, resourceParams, namer, false}, isCreater)
-		actions = appendIf(actions, action{request.MethodDeleteCollection, resourcePath, resourceParams, namer, false}, isCollectionDeleter)
+		// --- 开始定义要注册的 actions ---
+		// appendIf 是一个辅助函数，只有当最后的布尔条件为 true 时，才会将 action 添加到列表中。
+		// 这是一个非常简洁的写法，用来根据 storage 实现的接口动态添加路由。
+
+		// 在资源集合路径上（如 /api/v1/nodes）注册的 actions：
+		actions = appendIf(actions, action{request.MethodList, resourcePath, resourceParams, namer, false}, isLister)                        // GET /nodes (如果实现了 Lister)
+		actions = appendIf(actions, action{request.MethodPost, resourcePath, resourceParams, namer, false}, isCreater)                       // POST /nodes (如果实现了 Creater)
+		actions = appendIf(actions, action{request.MethodDeleteCollection, resourcePath, resourceParams, namer, false}, isCollectionDeleter) // DELETE /nodes (如果实现了 CollectionDeleter)
 		// DEPRECATED in 1.11
 		actions = appendIf(actions, action{request.MethodWatchList, "watch/" + resourcePath, resourceParams, namer, false}, allowWatchList)
 
 		// Add actions at the item path: /api/apiVersion/resource/{name}
-		actions = appendIf(actions, action{request.MethodGet, itemPath, nameParams, namer, false}, isGetter)
+		// 在单个资源路径上（如 /api/v1/nodes/{name}）注册的 actions：
+		actions = appendIf(actions, action{request.MethodGet, itemPath, nameParams, namer, false}, isGetter) // GET /nodes/{name} (如果实现了 Getter)
+
 		if getSubpath {
+			// 如果支持子路径代理，注册一个更通用的路径，如 /nodes/{name}/{path:*}
 			actions = appendIf(actions, action{request.MethodGet, itemPath + "/{path:*}", proxyParams, namer, false}, isGetter)
 		}
-		actions = appendIf(actions, action{request.MethodPut, itemPath, nameParams, namer, false}, isUpdater)
-		actions = appendIf(actions, action{request.MethodPatch, itemPath, nameParams, namer, false}, isPatcher)
-		actions = appendIf(actions, action{request.MethodDelete, itemPath, nameParams, namer, false}, isGracefulDeleter)
+		actions = appendIf(actions, action{request.MethodPut, itemPath, nameParams, namer, false}, isUpdater)            // PUT /nodes/{name} (如果实现了 Updater)
+		actions = appendIf(actions, action{request.MethodPatch, itemPath, nameParams, namer, false}, isPatcher)          // PATCH /nodes/{name} (如果实现了 Patcher)
+		actions = appendIf(actions, action{request.MethodDelete, itemPath, nameParams, namer, false}, isGracefulDeleter) // DELETE /nodes/{name} (如果实现了 GracefulDeleter)
 		// DEPRECATED in 1.11
 		actions = appendIf(actions, action{request.MethodWatch, "watch/" + itemPath, nameParams, namer, false}, isWatcher)
 		actions = appendIf(actions, action{request.MethodConnect, itemPath, nameParams, namer, false}, isConnecter)
 		actions = appendIf(actions, action{request.MethodConnect, itemPath + "/{path:*}", proxyParams, namer, false}, isConnecter && connectSubpath)
+		// --- Case 2: 处理命名空间作用域的资源（如 Pods, Deployments） ---
 	default:
 		namespaceParamName := "namespaces"
 		// Handler for standard REST verbs (GET, PUT, POST and DELETE).
+		// 定义一个 {namespace} 路径参数。
 		namespaceParam := ws.PathParameter("namespace", "object name and auth scope, such as for teams and projects").DataType("string")
+		// namespacedPath 是指特定命名空间下的资源集合路径，例如 "namespaces/{namespace}/pods"。
 		namespacedPath := namespaceParamName + "/{namespace}/" + resource
 		namespaceParams := []*restful.Parameter{namespaceParam}
-
+		// 同样的逻辑，但所有路径都以 "namespaces/{namespace}/" 为前缀。
 		resourcePath := namespacedPath
 		resourceParams := namespaceParams
 		itemPath := namespacedPath + "/{name}"
@@ -604,32 +645,36 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 		proxyParams := append(nameParams, pathParam)
 		itemPathSuffix := ""
 		if isSubresource {
+			// 子资源路径，例如 "namespaces/{namespace}/pods/{name}/log"。
 			itemPathSuffix = "/" + subresource
 			itemPath = itemPath + itemPathSuffix
 			resourcePath = itemPath
 			resourceParams = nameParams
 		}
 		apiResource.Name = path
-		apiResource.Namespaced = true
+		apiResource.Namespaced = true // 明确指出这是命名空间级资源。
 		apiResource.Kind = resourceKind
+		// 创建一个用于生成资源名称的辅助对象，指定为非集群作用域。
 		namer := handlers.ContextBasedNaming{
 			Namer:         a.group.Namer,
 			ClusterScoped: false,
 		}
-
-		actions = appendIf(actions, action{request.MethodList, resourcePath, resourceParams, namer, false}, isLister)
-		actions = appendIf(actions, action{request.MethodPost, resourcePath, resourceParams, namer, false}, isCreater)
-		actions = appendIf(actions, action{request.MethodDeleteCollection, resourcePath, resourceParams, namer, false}, isCollectionDeleter)
+		// --- 再次定义要注册的 actions，但这次是针对命名空间路径的 ---
+		// 在特定命名空间下的资源集合路径上（如 /api/v1/namespaces/{namespace}/pods）注册的 actions：
+		actions = appendIf(actions, action{request.MethodList, resourcePath, resourceParams, namer, false}, isLister)                        // GET /namespaces/{ns}/pods
+		actions = appendIf(actions, action{request.MethodPost, resourcePath, resourceParams, namer, false}, isCreater)                       // POST /namespaces/{ns}/pods
+		actions = appendIf(actions, action{request.MethodDeleteCollection, resourcePath, resourceParams, namer, false}, isCollectionDeleter) // DELETE /namespaces/{ns}/pods
 		// DEPRECATED in 1.11
 		actions = appendIf(actions, action{request.MethodWatchList, "watch/" + resourcePath, resourceParams, namer, false}, allowWatchList)
 
+		// 在特定命名空间下的单个资源路径上（如 /api/v1/namespaces/{namespace}/pods/{name}）注册的 actions：
 		actions = appendIf(actions, action{request.MethodGet, itemPath, nameParams, namer, false}, isGetter)
 		if getSubpath {
 			actions = appendIf(actions, action{request.MethodGet, itemPath + "/{path:*}", proxyParams, namer, false}, isGetter)
 		}
-		actions = appendIf(actions, action{request.MethodPut, itemPath, nameParams, namer, false}, isUpdater)
-		actions = appendIf(actions, action{request.MethodPatch, itemPath, nameParams, namer, false}, isPatcher)
-		actions = appendIf(actions, action{request.MethodDelete, itemPath, nameParams, namer, false}, isGracefulDeleter)
+		actions = appendIf(actions, action{request.MethodPut, itemPath, nameParams, namer, false}, isUpdater)            // PUT /namespaces/{ns}/pods/{name}
+		actions = appendIf(actions, action{request.MethodPatch, itemPath, nameParams, namer, false}, isPatcher)          // PATCH /namespaces/{ns}/pods/{name}
+		actions = appendIf(actions, action{request.MethodDelete, itemPath, nameParams, namer, false}, isGracefulDeleter) // DELETE /namespaces/{ns}/pods/{name}
 		// DEPRECATED in 1.11
 		actions = appendIf(actions, action{request.MethodWatch, "watch/" + itemPath, nameParams, namer, false}, isWatcher)
 		actions = appendIf(actions, action{request.MethodConnect, itemPath, nameParams, namer, false}, isConnecter)
@@ -638,13 +683,20 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 		// list or post across namespace.
 		// For ex: LIST all pods in all namespaces by sending a LIST request at /api/apiVersion/pods.
 		// TODO: more strongly type whether a resource allows these actions on "all namespaces" (bulk delete)
+		// --- 特殊处理：为跨所有命名空间的操作注册路由 ---
+		// 这对应于 `kubectl get pods -A` 或 `kubectl get pods --all-namespaces`。
+		// URL 路径不包含 `namespaces/{namespace}` 部分，例如 /api/v1/pods。
 		if !isSubresource {
+			// 只有主资源才支持跨命名空间操作，子资源不支持。
+			// `allNamespaces` 参数被设为 true，处理函数会据此改变其行为。
 			actions = appendIf(actions, action{request.MethodList, resource, params, namer, true}, isLister)
 			// DEPRECATED in 1.11
 			actions = appendIf(actions, action{request.MethodWatchList, "watch/" + resource, params, namer, true}, allowWatchList)
 		}
 	}
-
+	// --- 处理 StorageVersionAPI 特性 ---
+	// 这部分逻辑用于支持 Kubernetes 的 Storage Version API，这是一个较新的特性，
+	// 用于查询和管理 API 对象在 etcd 中的存储版本。
 	var resourceInfo *storageversion.ResourceInfo
 	if utilfeature.DefaultFeatureGate.Enabled(features.StorageVersionAPI) &&
 		utilfeature.DefaultFeatureGate.Enabled(features.APIServerIdentity) &&
@@ -652,6 +704,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 		storageVersionProvider.StorageVersion() != nil {
 
 		versioner := storageVersionProvider.StorageVersion()
+		// 获取资源在 etcd 中实际存储的 GVK（GroupVersionKind）。
 		encodingGVK, err := getStorageVersionKind(versioner, storage, a.group.Typer)
 		if err != nil {
 			return nil, nil, err
@@ -660,20 +713,21 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 		if a.group.ConvertabilityChecker != nil {
 			decodableVersions = a.group.ConvertabilityChecker.VersionsForGroupKind(fqKindToRegister.GroupKind())
 		}
-
+		// 构造一个 ResourceInfo 对象，包含所有关于存储版本的信息。
 		resourceInfo = &storageversion.ResourceInfo{
 			GroupResource: schema.GroupResource{
 				Group:    a.group.GroupVersion.Group,
 				Resource: apiResource.Name,
 			},
-			EncodingVersion: encodingGVK.GroupVersion().String(),
+			EncodingVersion: encodingGVK.GroupVersion().String(), // 记录编码版本。
 			// We record EquivalentResourceMapper first instead of calculate
 			// DecodableVersions immediately because API installation must
 			// be completed first for us to know equivalent APIs
+			// EquivalentResourceMapper 用于查找等效的资源（例如 `extensions/v1beta1/deployments` 和 `apps/v1/deployments`）。
 			EquivalentResourceMapper: a.group.EquivalentResourceRegistry,
-
+			// 可以直接解码的版本。
 			DirectlyDecodableVersions: decodableVersions,
-
+			// 此资源被提供的所有 API 版本。
 			ServedVersions: a.group.AllServedVersionsByResource[path],
 		}
 	}
@@ -694,33 +748,39 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 	// http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent
 	//
 	// test/integration/auth_test.go is currently the most comprehensive status code test
-
+	// 遍历 group.Serializer 支持的所有媒体类型（如 application/json, application/yaml）。
 	for _, s := range a.group.Serializer.SupportedMediaTypes() {
+		// 确保每个序列化器都定义了完整的媒体类型。
 		if len(s.MediaTypeSubType) == 0 || len(s.MediaTypeType) == 0 {
 			return nil, nil, fmt.Errorf("all serializers in the group Serializer must have MediaTypeType and MediaTypeSubType set: %s", s.MediaType)
 		}
 	}
+	// 获取用于 HTTP 内容协商的媒体类型列表。
 	mediaTypes, streamMediaTypes := negotiation.MediaTypesForSerializer(a.group.Serializer)
 	allMediaTypes := append(mediaTypes, streamMediaTypes...)
+	// 告诉 go-restful 这个 WebService 可以产生（Produces）哪些媒体类型的内容。
 	ws.Produces(allMediaTypes...)
 
-	kubeVerbs := map[string]struct{}{}
+	kubeVerbs := map[string]struct{}{} // 用于收集该资源支持的所有 Kube Verbs（用于服务发现）。
+	// reqScope 是一个核心结构体，它封装了处理一个 API 请求所需的所有上下文和辅助工具。
+	// 它会被传递给每个 HTTP 处理函数。
 	reqScope := handlers.RequestScope{
-		Serializer:      a.group.Serializer,
-		ParameterCodec:  a.group.ParameterCodec,
-		Creater:         a.group.Creater,
-		Convertor:       a.group.Convertor,
-		Defaulter:       a.group.Defaulter,
-		Typer:           a.group.Typer,
-		UnsafeConvertor: a.group.UnsafeConvertor,
-		Authorizer:      a.group.Authorizer,
+		Serializer:      a.group.Serializer,      // 序列化/反序列化器
+		ParameterCodec:  a.group.ParameterCodec,  // URL 查询参数编解码器
+		Creater:         a.group.Creater,         // 对象创建器
+		Convertor:       a.group.Convertor,       // 版本转换器
+		Defaulter:       a.group.Defaulter,       // 默认值设置器
+		Typer:           a.group.Typer,           // 类型信息获取器
+		UnsafeConvertor: a.group.UnsafeConvertor, // 不安全的转换器
+		Authorizer:      a.group.Authorizer,      // 授权器
 
-		EquivalentResourceMapper: a.group.EquivalentResourceRegistry,
+		EquivalentResourceMapper: a.group.EquivalentResourceRegistry, // 等效资源映射器
 
 		// TODO: Check for the interface on storage
-		TableConvertor: tableProvider,
+		TableConvertor: tableProvider, // 表格转换器
 
 		// TODO: This seems wrong for cross-group subresources. It makes an assumption that a subresource and its parent are in the same group version. Revisit this.
+		// 记录当前处理的资源、子资源和 Kind。
 		Resource:    a.group.GroupVersion.WithResource(resource),
 		Subresource: subresource,
 		Kind:        fqKindToRegister,
@@ -729,9 +789,9 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 
 		HubGroupVersion: schema.GroupVersion{Group: fqKindToRegister.Group, Version: runtime.APIVersionInternal},
 
-		MetaGroupVersion: metav1.SchemeGroupVersion,
+		MetaGroupVersion: metav1.SchemeGroupVersion, // 元数据对象（如 Status, ListOptions）的版本。
 
-		MaxRequestBodyBytes: a.group.MaxRequestBodyBytes,
+		MaxRequestBodyBytes: a.group.MaxRequestBodyBytes, // 最大请求体大小限制。
 	}
 	if a.group.MetaGroupVersion != nil {
 		reqScope.MetaGroupVersion = *a.group.MetaGroupVersion
@@ -748,6 +808,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 	//
 	// For subresources that provide write access to only specific nested fields
 	// fieldpath.NewPatternFilter can help create a filter to reset all other fields.
+	// --- 处理 Server-Side Apply (SSA) 的字段管理逻辑 ---
 	var resetFieldsFilter map[fieldpath.APIVersion]fieldpath.Filter
 	resetFieldsStrategy, isResetFieldsStrategy := storage.(rest.ResetFieldsStrategy)
 	if isResetFieldsStrategy {
@@ -773,22 +834,24 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create field manager: %v", err)
 	}
-
+	// =========================================================================
+	// === 核心循环：遍历之前收集的所有 action，为每个 action 创建并注册路由 ===
+	// =========================================================================
 	for _, action := range actions {
 		producedObject := storageMeta.ProducesObject(action.Verb)
 		if producedObject == nil {
 			producedObject = defaultVersionedObject
 		}
 		reqScope.Namer = action.Namer
-
+		// --- 根据 action 的属性，确定用于监控指标的标签 ---
 		requestScope := "cluster"
 		var namespaced string
 		var operationSuffix string
-		if apiResource.Namespaced {
+		if apiResource.Namespaced { // 命名空间级
 			requestScope = "namespace"
 			namespaced = "Namespaced"
 		}
-		if strings.HasSuffix(action.Path, "/{path:*}") {
+		if strings.HasSuffix(action.Path, "/{path:*}") { // 带子路径
 			requestScope = "resource"
 			operationSuffix = operationSuffix + "WithPath"
 		}
@@ -800,7 +863,7 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 			operationSuffix = operationSuffix + "ForAllNamespaces"
 			namespaced = ""
 		}
-
+		// 将 action 的动词转换为服务发现使用的 Kube Verb（如 "get", "list", "create"）。
 		if kubeVerb, found := toDiscoveryKubeVerb[action.Verb]; found {
 			if len(kubeVerb) != 0 {
 				kubeVerbs[kubeVerb] = struct{}{}
@@ -844,11 +907,14 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 				warnings = append(warnings, deprecation.WarningMessage(versionedPtrWithGVK))
 			}
 		}
-
+		// ============================================================
+		// === 巨大的 switch 语句，为每种 action.Verb 创建路由 ===
+		// ============================================================
 		switch action.Verb {
-		case request.MethodGet: // Get a resource.
+		case request.MethodGet: // Get a resource.  // 处理 GET 请求 (获取单个资源)
 			var handler restful.RouteFunction
 			if isGetterWithOptions {
+				// 如果 storage 支持带选项的 Get，使用 restfulGetResourceWithOptions 工厂函数。
 				handler = restfulGetResourceWithOptions(getterWithOptions, reqScope, isSubresource)
 			} else {
 				handler = restfulGetResource(getter, reqScope)
@@ -863,9 +929,11 @@ func (a *APIInstaller) registerResourceHandlers(path string, storage rest.Storag
 			handler = utilwarning.AddWarningsHandler(handler, warnings)
 
 			doc := "read the specified " + kind
+
 			if isSubresource {
 				doc = "read " + subresource + " of the specified " + kind
 			}
+			// --- 使用链式调用构建一个完整的 go-restful Route ---
 			route := ws.GET(action.Path).To(handler).
 				Doc(doc).
 				Param(ws.QueryParameter("pretty", "If 'true', then the output is pretty printed. Defaults to 'false' unless the user-agent indicates a browser or command-line HTTP tool (curl and wget).")).

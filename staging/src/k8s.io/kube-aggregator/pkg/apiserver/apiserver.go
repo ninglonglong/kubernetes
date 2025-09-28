@@ -504,40 +504,71 @@ func (c completedConfig) NewWithDelegate(delegationTarget genericapiserver.Deleg
 
 // PrepareRun prepares the aggregator to run, by setting up the OpenAPI spec &
 // aggregated discovery document and calling the generic PrepareRun.
+// PrepareRun 是 APIAggregator 的核心准备函数。
+// 在 apiserver 真正开始监听和提供服务之前，这个函数会被调用，以完成所有的初始化和组装工作。
+// 它负责设置 PostStartHook、准备其内嵌的 GenericAPIServer，并最重要的是，构建和注册 OpenAPI 聚合器。
 func (s *APIAggregator) PrepareRun() (preparedAPIAggregator, error) {
 	// add post start hook before generic PrepareRun in order to be before /healthz installation
+	// 1. 【前置操作】注册 OpenAPI 聚合控制器的 PostStartHook。
+	// 这里的操作必须在调用 s.GenericAPIServer.PrepareRun() 之前完成。
+	// 因为 GenericAPIServer.PrepareRun() 会安装 /healthz 等健康检查端点，而 PostStartHook 是健康检查的一部分。
+	// 我们需要确保这些 hook 在健康检查服务可用之前就已经注册好。
+
+	// 打印一个自定义的日志，方便在调试时定位到这个函数已经被执行。
 	print("ningminglong update")
 	if s.openAPIConfig != nil {
+		// ...就注册一个名为 "apiservice-openapi-controller" 的 PostStartHook。
+		// PostStartHook 是在 apiserver 主服务启动后、但被标记为 "Ready" 之前执行的任务。
 		s.GenericAPIServer.AddPostStartHookOrDie("apiservice-openapi-controller", func(context genericapiserver.PostStartHookContext) error {
+			// 这个 hook 的任务是启动 OpenAPI v2 的聚合控制器 (AggregationController)。
+			// 这个控制器会持续监控 APIService 对象的变化，并从后端服务（如 metrics-server）下载它们的 OpenAPI v2 规范，
+			// 然后将这些规范聚合成一个统一的 OpenAPI v2 文档。
 			go s.openAPIAggregationController.Run(context.Done())
 			return nil
 		})
 	}
 
 	if s.openAPIV3Config != nil {
+		// ...也为 OpenAPI v3 注册一个类似的 PostStartHook。
 		s.GenericAPIServer.AddPostStartHookOrDie("apiservice-openapiv3-controller", func(context genericapiserver.PostStartHookContext) error {
+			// 启动 OpenAPI v3 的聚合控制器。
 			go s.openAPIV3AggregationController.Run(context.Done())
 			return nil
 		})
 	}
-
+	// 2. 【核心准备】调用内嵌的 GenericAPIServer 的 PrepareRun 方法。
+	// 这是非常关键的一步。它会执行所有通用的 apiserver 准备工作，包括：
+	// - 构建“洋葱模型”的 HTTP 处理链（调用 DefaultBuildHandlerChain）。
+	// - 安装诸如 /healthz, /livez, /readyz 等非 API 端点。
+	// - 准备好底层的 HTTP 服务器，但还不开始监听。
+	// `prepared` 对象包含了一个可以被运行的 `Runnable` 实例。
 	prepared := s.GenericAPIServer.PrepareRun()
 
 	// delay OpenAPI setup until the delegate had a chance to setup their OpenAPI handlers
+	// 3. 【后置操作】构建和注册 OpenAPI 聚合器本身。
+	// 这部分逻辑必须在 GenericAPIServer.PrepareRun() 之后执行，
+	// 因为它需要访问到已经准备好的 HTTP Handler（如 GoRestfulContainer 和 NonGoRestfulMux）。
 	if s.openAPIConfig != nil {
+		// 创建一个 spec 下载器，用于从后端的 APIService 下载 OpenAPI 规范。
 		specDownloader := openapiaggregator.NewDownloader()
+		// 构建并注册 OpenAPI v2 聚合器。
+		// 这个函数非常重要，它会：
+		// a. 创建一个 OpenAPI 聚合服务。
+		// b. 将这个聚合服务的 HTTP Handler 注册到 apiserver 的 Mux 中，使其能够处理对 /openapi/v2 路径的请求。
 		openAPIAggregator, err := openapiaggregator.BuildAndRegisterAggregator(
 			&specDownloader,
-			s.GenericAPIServer.NextDelegate(),
-			s.GenericAPIServer.Handler.GoRestfulContainer.RegisteredWebServices(),
-			s.openAPIConfig,
-			s.GenericAPIServer.Handler.NonGoRestfulMux)
+			s.GenericAPIServer.NextDelegate(), // 获取委托的 HTTP Handler，用于处理未被 aggregator 捕获的请求
+			s.GenericAPIServer.Handler.GoRestfulContainer.RegisteredWebServices(), // 获取已注册的 WebService，以便提取它们的 OpenAPI 定义
+			s.openAPIConfig, // 将聚合器的 Handler 注册到这个 Mux
+			s.GenericAPIServer.Handler.NonGoRestfulMux) // 将聚合器的 Handler 注册到这个 Mux
 		if err != nil {
 			return preparedAPIAggregator{}, err
 		}
+		// 创建 OpenAPI v2 聚合控制器，并将上面创建的聚合器和下载器注入进去。
+		// 这个控制器就是我们在一开始的 PostStartHook 中要运行的东西。
 		s.openAPIAggregationController = openapicontroller.NewAggregationController(&specDownloader, openAPIAggregator)
 	}
-
+	// 对 OpenAPI v3 执行完全相同的逻辑。
 	if s.openAPIV3Config != nil {
 		specDownloaderV3 := openapiv3aggregator.NewDownloader()
 		openAPIV3Aggregator, err := openapiv3aggregator.BuildAndRegisterAggregator(
@@ -551,7 +582,9 @@ func (s *APIAggregator) PrepareRun() (preparedAPIAggregator, error) {
 		}
 		s.openAPIV3AggregationController = openapiv3controller.NewAggregationController(openAPIV3Aggregator)
 	}
-
+	// 4. 【返回结果】
+	// 返回一个 `preparedAPIAggregator` 结构体，它包含了准备好的 `APIAggregator` 自身，
+	// 以及一个可以被启动器运行的 `runnable` 对象。
 	return preparedAPIAggregator{APIAggregator: s, runnable: prepared}, nil
 }
 

@@ -122,6 +122,7 @@ func (d director) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	path := req.URL.Path
 
 	// check to see if our webservices want to claim this path
+
 	for _, ws := range d.goRestfulContainer.RegisteredWebServices() {
 		switch {
 		case ws.RootPath() == "/apis":

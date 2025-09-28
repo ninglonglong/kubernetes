@@ -135,27 +135,54 @@ func (o CustomResourceDefinitionsServerOptions) Config() (*apiserver.Config, err
 //
 // Avoid messing with anything outside of changes to StorageConfig as that
 // may lead to unexpected behavior when the options are applied.
+// NewCRDRESTOptionsGetter 函数创建并返回一个 genericregistry.RESTOptionsGetter。
+// RESTOptionsGetter 是一个非常重要的接口，它的核心作用是为某个特定的 API 资源（在这里是所有的 Custom Resource）
+// 提供一套与后端存储（Etcd）交互的完整配置，这套配置被称为 genericregistry.RESTOptions。
+// RESTOptions 包含了诸如编解码器(Codec)、存储装饰器(Decorator)等关键信息。
+//
+// 简而言之，这个函数就是为所有 "kubectl get my-crd-instance" 这样的操作，定制其在 Etcd 层面上的读写行为。
 func NewCRDRESTOptionsGetter(etcdOptions genericoptions.EtcdOptions, resourceTransformers storagevalue.ResourceTransformers, tracker flowcontrolrequest.StorageObjectCountTracker) genericregistry.RESTOptionsGetter {
+	// 1. 准备 CBOR 序列化器。
+	// CBOR (Concise Binary Object Representation) 是一种二进制序列化格式，类似于 JSON，但更紧凑、解析更快。
+	// 这里创建了一个专门用于序列化和反序列化 unstructured.Unstructured 对象的 CBOR 序列化器。
+	// unstructured.Unstructured 是 Kubernetes 中用来表示所有 CR (Custom Resource) 的通用数据结构，本质上是一个 map[string]interface{}。
 	ucbor := cbor.NewSerializer(unstructuredscheme.NewUnstructuredCreator(), unstructuredscheme.NewUnstructuredObjectTyper())
-
+	// 2. 根据特性门控 (Feature Gate) 决定默认的编码器。
+	// encoder 将被用于将内存中的对象序列化成二进制数据，以便存入 Etcd。
 	encoder := unstructured.UnstructuredJSONScheme
 	if utilfeature.DefaultFeatureGate.Enabled(features.CBORServingAndStorage) {
 		encoder = ucbor
 	}
-
+	// 3. 定制化为 CRD 专用的 Etcd 存储配置。
+	// 创建 etcdOptions 的一个副本，以避免修改原始配置。
 	etcdOptionsCopy := etcdOptions
+	// 关键步骤：为 CRD 存储配置一个特殊的编解码器 (Codec)。
 	etcdOptionsCopy.StorageConfig.Codec = runtime.NewCodec(
-		encoder,
+		encoder, // 编码器：使用我们上面根据特性门控选择的 encoder (JSON 或 CBOR)。
 		// Whether the feature gate is enabled or disabled, the decoder must be able to
 		// recognize any resources stored using the CBOR encoder.
+		// 解码器：这里使用了一个 "recognizer" (识别器)。
+		// 这是一个非常重要的健壮性设计！
+		// 无论 CBORServingAndStorage 特性门控是开启还是关闭，解码器都必须有能力同时识别和解析 CBOR 和 JSON 两种格式。
+		// 这是因为 Etcd 中可能同时存在新旧两种格式的数据（比如，在特性门控状态变更期间）。
+		// recognizer 会自动检测输入数据的格式，然后选择正确的解码器 (ucbor 或 UnstructuredJSONScheme) 来进行解析。
 		recognizer.NewDecoder(
 			ucbor,
 			unstructured.UnstructuredJSONScheme,
 		),
 	)
+	// 设置存储对象数量追踪器。
 	etcdOptionsCopy.StorageConfig.StorageObjectCountTracker = tracker
-	etcdOptionsCopy.WatchCacheSizes = nil // this control is not provided for custom resources
+	// 清空 WatchCacheSizes 配置。
+	// 对于 CRD，Kubernetes 不提供单独控制其 Watch 缓存大小的选项，所以这里将其设置为 nil，
+	// 以确保 CRD 使用的是全局默认的 Watch 缓存配置。
 
+	etcdOptionsCopy.WatchCacheSizes = nil // this control is not provided for custom resources
+	// 4. 创建并返回最终的 RESTOptionsGetter。
+	// etcdOptions.CreateRESTOptionsGetter 是一个工厂方法，它接收一个存储工厂 (StorageFactory)
+	// 和资源转换器 (resourceTransformers)，然后生成一个闭包函数，这个闭包就是 RESTOptionsGetter。
+	// 当 apiserver 需要为某个 CRD 资源构建存储后端时，就会调用这个返回的闭包函数，
+	// 闭包函数内部会使用我们在这里精心定制的 `etcdOptionsCopy.StorageConfig` 来创建与 Etcd 交互所需的所有选项。
 	return etcdOptions.CreateRESTOptionsGetter(&genericoptions.SimpleStorageFactory{StorageConfig: etcdOptionsCopy.StorageConfig}, resourceTransformers)
 }
 

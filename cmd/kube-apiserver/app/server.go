@@ -374,31 +374,72 @@ func SetServiceResolverForTests(resolver webhook.ServiceResolver) func() {
 	}
 }
 
+// buildServiceResolver 函数用于构建一个 webhook.ServiceResolver。
+// 这个 ServiceResolver 的核心作用是，根据一个 Service 的命名空间和名称，解析出其后端可供连接的、具体的 IP 地址和端口。
+// 简单来说，它就是 kube-aggregator 的“导航系统”。
+// enabledAggregatorRouting 是一个关键的开关。
+// 如果为 true，则使用更现代、更高效的 EndpointSlice 模式，直接连接到后端 Pod 的 IP。
+// 如果为 false，则使用传统的 ClusterIP 模式，连接到 Service 的虚拟 IP。
 func buildServiceResolver(enabledAggregatorRouting bool, hostname string, informer clientgoinformers.SharedInformerFactory) (webhook.ServiceResolver, error) {
 	if testServiceResolver != nil {
 		return testServiceResolver, nil
 	}
+	// 这是一个用于单元测试的钩子。在生产环境中，testServiceResolver 总是 nil，
+	// 所以这部分代码在正常运行时会被跳过。
 
+	// 创建一个 EndpointSlice 获取器。
+	// 这个获取器被优化过，可以通过索引高效地从 Informer 缓存中查询与特定 Service 关联的 EndpointSlice。
+	// EndpointSlice 是存储 Service 后端 Pod IP 的现代方式，比旧的 Endpoints 对象扩展性更好。
 	endpointSliceGetter, err := proxy.NewEndpointSliceIndexerGetter(informer.Discovery().V1().EndpointSlices())
 	if err != nil {
 		return nil, err
 	}
 
+	// 声明一个 serviceResolver 变量，它的具体类型将由 enabledAggregatorRouting 开关决定。
 	var serviceResolver webhook.ServiceResolver
+
 	if enabledAggregatorRouting {
+		// 【模式一：推荐的现代模式】
+		// 如果启用了 aggregator 路由，则创建一个 EndpointServiceResolver。
+		// 这个 resolver 非常智能，它会直接查找后端 Pod 的 IP 地址。
+		// 它的工作流程是：
+		// 1. 使用 services.Lister 找到目标 Service。
+		// 2. 使用 endpointSliceGetter 找到该 Service 对应的所有健康的 EndpointSlice。
+		// 3. 从 EndpointSlice 中直接提取一个后端 Pod 的 IP 和端口作为连接目标。
+		// 优点：绕过了 kube-proxy 和虚拟 ClusterIP，连接更直接、高效、可靠。
 		serviceResolver = aggregatorapiserver.NewEndpointServiceResolver(
-			informer.Core().V1().Services().Lister(),
-			endpointSliceGetter,
+			informer.Core().V1().Services().Lister(), // 提供 Service 的缓存访问能力
+			endpointSliceGetter,                      // 提供 EndpointSlice 的缓存访问能力
 		)
 	} else {
+		// 【模式二：兼容的旧模式】
+		// 如果禁用了 aggregator 路由，则创建一个 ClusterIPServiceResolver。
+		// 这个 resolver 的工作方式比较简单：
+		// 1. 使用 services.Lister 找到目标 Service。
+		// 2. 直接返回该 Service 对象上定义的 spec.clusterIP 和端口。
+		// 缺点：aggregator 会去连接一个虚拟 IP，这个连接依赖于 apiserver 所在节点上的网络规则（由 kube-proxy 设置），
+		// 增加了一个依赖环节和潜在的故障点。
 		serviceResolver = aggregatorapiserver.NewClusterIPServiceResolver(
 			informer.Core().V1().Services().Lister(),
 		)
 	}
 
 	// resolve kubernetes.default.svc locally
+	// 【装饰器模式：处理“自己访问自己”的特殊情况】
+	// 无论上面创建了哪种类型的 resolver，这里都会用一个 LoopbackServiceResolver 将其包裹起来。
+	// 这是一种 "装饰器" 设计模式，在不改变原有 resolver 的情况下，为其增加新的功能。
+
+	// 首先，尝试解析 apiserver 自己的监听地址。
 	if localHost, err := url.Parse(hostname); err == nil {
+		// 如果解析成功，就创建一个 LoopbackServiceResolver。
+		// 这个新的 resolver 会在调用被它包裹的 resolver 之前，先做一个检查：
+		// 1. 检查要解析的服务是不是 "kubernetes.default.svc" (即 apiserver 自己)。
+		// 2. 如果是，它就“短路”整个解析过程，直接返回 apiserver 的本地回环地址（localHost）。
+		// 3. 如果不是，它才调用被包裹的 resolver（即上面创建的 EndpointResolver 或 ClusterIPResolver）来执行常规的解析。
+		// 这样做可以避免 apiserver 在需要访问自己时，还傻傻地跑到网络上去绕一圈。
 		serviceResolver = aggregatorapiserver.NewLoopbackServiceResolver(serviceResolver, localHost)
 	}
+	// 返回最终构建好的、可能被层层包裹的 serviceResolver。
+
 	return serviceResolver, nil
 }

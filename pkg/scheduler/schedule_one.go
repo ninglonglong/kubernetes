@@ -63,18 +63,25 @@ const (
 )
 
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
+// ScheduleOne 完成单个 pod 的整个调度工作流。
+// 这个函数在调度算法的主机适配部分是串行执行的。
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
+	// 从上下文中获取日志记录器。
 	logger := klog.FromContext(ctx)
+	// 从调度队列中获取下一个需要调度的 Pod。
+	// NextPod() 是一个阻塞操作，如果队列为空，它会一直等待，直到有新的 Pod 入队。
 	podInfo, err := sched.NextPod(logger)
 	if err != nil {
 		utilruntime.HandleErrorWithContext(ctx, err, "Error while retrieving next pod from scheduling queue")
 		return
 	}
 	// pod could be nil when schedulerQueue is closed
+	// 当调度队列被关闭时 (例如 scheduler 正在退出)，NextPod() 会返回 nil。
+	// 此时直接返回，以优雅地结束这个 goroutine。
 	if podInfo == nil || podInfo.Pod == nil {
 		return
 	}
-
+	// 拿到 Pod 对象，并为日志添加 Pod 的上下文信息，方便追踪。
 	pod := podInfo.Pod
 	// TODO(knelasevero): Remove duplicated keys from log entry calls
 	// When contextualized logging hits GA
@@ -82,7 +89,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	ctx = klog.NewContext(ctx, logger)
 	logger.V(4).Info("About to try and schedule pod", "pod", klog.KObj(pod))
-
+	// 根据 Pod 的 `spec.schedulerName` 找到对应的调度框架 (framework)。
 	fwk, err := sched.frameworkForPod(pod)
 	if err != nil {
 		// This shouldn't happen, because we only accept for scheduling the pods
@@ -91,8 +98,11 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		sched.SchedulingQueue.Done(pod.UID)
 		return
 	}
+	// 运行 PreFilter 插件，做一个快速的预检。
+	// 如果 `skipPodSchedule` 返回 true，意味着这个 Pod 目前无法调度，并且不需要重试。
 	if sched.skipPodSchedule(ctx, fwk, pod) {
 		// We don't put this Pod back to the queue, but we have to cleanup the in-flight pods/events.
+		// 我们不会把这个 Pod 放回队列，但需要清理正在处理的 Pod 记录。
 		sched.SchedulingQueue.Done(pod.UID)
 		return
 	}
@@ -100,36 +110,52 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
 
 	// Synchronously attempt to find a fit for the pod.
+	// --- 同步地尝试为 Pod 找到一个合适的节点 ---
+	// 记录调度周期的开始时间，用于性能监控。
 	start := time.Now()
+	// 创建一个 CycleState，它是一个临时的上下文对象，用于在本次调度周期的各个插件之间传递数据。
 	state := framework.NewCycleState()
 	// For the sake of performance, scheduler does not measure and export the scheduler_plugin_execution_duration metric
 	// for every plugin execution in each scheduling cycle. Instead it samples a portion of scheduling cycles - percentage
 	// determined by pluginMetricsSamplePercent. The line below helps to randomly pick appropriate scheduling cycles.
+	// 为了性能，调度器不会为每个调度周期都记录插件执行时间的度量。
+	// 相反，它会按 `pluginMetricsSamplePercent` 的百分比进行采样。下面这行代码就是用来随机选择是否记录本次度量。
 	state.SetRecordPluginMetrics(rand.Intn(100) < pluginMetricsSamplePercent)
 
 	// Initialize an empty podsToActivate struct, which will be filled up by plugins or stay empty.
+	// 初始化一个空的 podsToActivate 结构体，它可能会被插件填充（例如，抢占时需要激活被抢占的Pod）。
 	podsToActivate := framework.NewPodsToActivate()
 	state.Write(framework.PodsToActivateKey, podsToActivate)
-
+	// 创建一个与调度周期绑定的上下文，如果调度周期提前结束，可以取消后续操作。
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
+	// 这是核心的调度周期函数，它会执行 "Filter" 和 "Score" 两个阶段。
+	// `schedulingCycle` 是一个同步操作，它会返回调度结果、一个“假设的”Pod信息，以及一个状态。
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
 	if !status.IsSuccess() {
+		// 如果调度失败（比如找不到合适的节点），则调用 FailureHandler 来处理失败。
+		// FailureHandler 可能会尝试抢占 (preemption)，或者只是简单地将 Pod 放入不可调度队列。
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
 		return
 	}
 
 	// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
+
+	// --- 异步地将 Pod 绑定到其主机 ---
+	// 我们能这样做，是因为在上面的 `schedulingCycle` 中已经做了“假设”步骤。
+	// 即，调度器已经在内存中认为这个 Pod 已经占用了目标节点的资源。
 	go func() {
 		bindingCycleCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
+		// 增加绑定 goroutine 的度量计数。
 
 		metrics.Goroutines.WithLabelValues(metrics.Binding).Inc()
 		defer metrics.Goroutines.WithLabelValues(metrics.Binding).Dec()
-
+		// `bindingCycle` 函数会运行 "Reserve", "PreBind", "Bind" 插件，最终通过 API 调用将 Pod 绑定到节点。
 		status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
 		if !status.IsSuccess() {
+			// 如果绑定失败（例如，apiserver拒绝了绑定），则调用错误处理函数。
+			// 这个函数会回滚之前的“假设”，并将 Pod 重新放回队列中。
 			sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
 			return
 		}
@@ -428,123 +454,198 @@ func (sched *Scheduler) skipPodSchedule(ctx context.Context, fwk framework.Frame
 // If it succeeds, it will return the name of the node.
 // If it fails, it will return a FitError with reasons.
 func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
+	// 创建一个新的追踪实例，用于性能分析。它可以记录各个步骤的耗时。
+	// 第一个参数是追踪的名称 "Scheduling"，后面是与本次追踪相关的字段，如 Pod 的命名空间和名称。
 	trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pod.Namespace}, utiltrace.Field{Key: "name", Value: pod.Name})
+	// defer 语句确保在函数返回时执行。如果整个追踪过程超过 100 毫秒，它会自动记录一条日志。
+	// 这对于发现慢速调度非常有帮助。
 	defer trace.LogIfLong(100 * time.Millisecond)
+	// 更新调度器缓存的快照。这是非常关键的一步。
+	// scheduler cache 中存储着集群 Node 和 Pod 的信息，但它可能不是最新的。
+	// UpdateSnapshot 会创建一个当前缓存状态的“快照”（snapshot），保证在这一次调度周期内，
+	// 所有的过滤和打分插件看到的是一个一致的、不变的世界视图。
+	// 这样做可以避免在调度过程中，因为其他地方（如 kubelet 上报状态）修改了缓存而导致数据不一致。
 	if err := sched.Cache.UpdateSnapshot(klog.FromContext(ctx), sched.nodeInfoSnapshot); err != nil {
 		return result, err
 	}
+	// 在性能追踪中记录一个步骤，表示“快照”已经完成。
 	trace.Step("Snapshotting scheduler cache and node infos done")
-
+	// 检查快照中是否有任何节点。
+	// 如果快照中的节点数量为 0，意味着调度器认为集群中一个可用的节点都没有。
 	if sched.nodeInfoSnapshot.NumNodes() == 0 {
+		// 直接返回一个 "没有可用节点" 的错误，无需进行后续的过滤操作。
 		return result, ErrNoNodesAvailable
 	}
-
+	// 找出所有满足 Pod 运行条件的节点。这是“过滤”阶段的核心调用。
+	// sched.findNodesThatFitPod 函数会遍历快照中的所有节点，
+	// 并对每个节点依次运行调度框架（fwk）中注册的所有 Filter 插件（如 PodFitsResources, TaintToleration 等）。
 	feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
 	if err != nil {
+		// 如果在执行过滤插件的过程中发生了不可恢复的错误，则返回该错误。
 		return result, err
 	}
+	// 在性能追踪中记录一个步骤，表示“谓词计算（过滤）”已经完成。
+	// "Predicates" 是 Filter 插件的旧称。
 	trace.Step("Computing predicates done")
-
+	// 检查经过所有 Filter 插件筛选后，是否还有剩余的可行节点。
 	if len(feasibleNodes) == 0 {
+		// 如果 feasibleNodes 列表为空，说明没有一个节点能够满足这个 Pod 的所有要求。
+		// 这时，调度失败。
+		// 返回一个特殊的 FitError 错误。
 		return result, &framework.FitError{
-			Pod:         pod,
-			NumAllNodes: sched.nodeInfoSnapshot.NumNodes(),
-			Diagnosis:   diagnosis,
+			Pod:         pod,                               // 哪个 Pod 调度失败了。
+			NumAllNodes: sched.nodeInfoSnapshot.NumNodes(), // 当时集群中总共有多少个节点。
+			Diagnosis:   diagnosis,                         //诊断信息，包含了每个节点是因为哪个 Filter 插件失败而被淘汰的。这对于调试非常有用。
 		}
 	}
 
 	// When only one node after predicate, just use it.
+	// 这是一个非常常见的优化。
+	// 如果经过过滤阶段后，只剩下一个可行的节点，那就没必要再进行复杂的打分了。
+	// 因为没有其他选择，这个节点就是唯一的、也是最终的选择。
 	if len(feasibleNodes) == 1 {
+		// 直接构建一个成功的 ScheduleResult。
 		return ScheduleResult{
-			SuggestedHost:  feasibleNodes[0].Node().Name,
-			EvaluatedNodes: 1 + diagnosis.NodeToStatus.Len(),
-			FeasibleNodes:  1,
-		}, nil
+			SuggestedHost:  feasibleNodes[0].Node().Name,     // 建议的主机就是这唯一一个可行节点的名称。
+			EvaluatedNodes: 1 + diagnosis.NodeToStatus.Len(), // 评估过的节点总数 = 1个可行节点 + 之前被过滤掉的节点数。
+			FeasibleNodes:  1,                                // 可行节点的数量是 1。
+		}, nil // 返回 nil 表示没有错误。
 	}
-
+	// 如果有多个可行节点，就需要进入“打分”阶段来优中选优。
+	// prioritizeNodes 函数会遍历所有 feasibleNodes（可行节点列表）。
+	// 它会做两件事：
+	// 1. 对于每个节点，运行调度框架（fwk）中注册的所有 Score 插件（如 ImageLocalityPriority, LeastRequestedPriority 等）。
+	// 2. 将每个插件的分数乘以其权重（weight），然后求和，得到每个节点的最终总分。
+	// 3. 同时，它还会处理旧式的 Extenders（外部扩展调度器），如果配置了，会调用它们进行打分。
 	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
 	if err != nil {
 		return result, err
 	}
-
+	// 从打分后的节点列表中选出最终的主机。
+	// selectHost 函数会接收一个按分数排好序的节点列表（priorityList）。
+	// 它会简单地选择列表中分数最高的那个节点作为最终的“获胜者”。
+	// 如果有多个节点得分相同，它会从中随机选择一个，以实现负载的随机分布。
+	// numberOfHighestScoredNodesToReport 用于在事件中报告得分最高的N个节点，方便调试。
 	host, _, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
+	// 在性能追踪中记录一个步骤，表示“优先级排序（打分）”已经完成。
+	// "Prioritizing" 是 Score 插件的旧称。
 	trace.Step("Prioritizing done")
-
+	// 构建最终的成功调度结果。
 	return ScheduleResult{
-		SuggestedHost:  host,
-		EvaluatedNodes: len(feasibleNodes) + diagnosis.NodeToStatus.Len(),
-		FeasibleNodes:  len(feasibleNodes),
+		SuggestedHost:  host,                                              // 建议的主机就是打分最高的那个。
+		EvaluatedNodes: len(feasibleNodes) + diagnosis.NodeToStatus.Len(), // 评估过的节点总数 = 所有可行节点数 + 被过滤掉的节点数。
+		FeasibleNodes:  len(feasibleNodes),                                // 可行节点的数量。
 	}, err
 }
 
 // Filters the nodes to find the ones that fit the pod based on the framework
 // filter plugins and filter extenders.
 func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, state fwk.CycleState, pod *v1.Pod) ([]fwk.NodeInfo, framework.Diagnosis, error) {
+	// 从上下文中获取日志记录器实例。
 	logger := klog.FromContext(ctx)
+	// 初始化一个诊断对象。这个对象将用于收集调度失败的原因。
 	diagnosis := framework.Diagnosis{
+		// NodeToStatus 记录了每个节点因为哪个插件而失败。
+		// 这里初始化为一个默认的空状态映射。
 		NodeToStatus: framework.NewDefaultNodeToStatus(),
 	}
-
+	// 从调度器缓存的快照中，获取所有节点的信息列表。
+	// allNodes 是本次调度需要评估的全部节点。
 	allNodes, err := sched.nodeInfoSnapshot.NodeInfos().List()
 	if err != nil {
+		// 如果获取节点列表失败，这是一个内部错误，直接返回。
 		return nil, diagnosis, err
 	}
 	// Run "prefilter" plugins.
+	// 运行“预过滤”插件 (PreFilter plugins)。
+	// RunPreFilterPlugins 会依次调用调度框架中注册的所有 PreFilter 插件。
+	// PreFilter 插件不针对任何特定节点，而是对 Pod 本身进行全局检查。
+	// 比如，检查 Pod 关联的 PVC 是否存在，或者 Pod 的亲和性规则是否自相矛盾等。
 	preRes, s, unscheduledPlugins := schedFramework.RunPreFilterPlugins(ctx, state, pod)
+	// 如果有任何 PreFilter 插件被跳过（因为它们不适用于这个Pod），则记录下来。
 	diagnosis.UnschedulablePlugins = unscheduledPlugins
+	// 检查 PreFilter 阶段的总体状态。
 	if !s.IsSuccess() {
 		if !s.IsRejected() {
+			// 如果这个状态不是 "Rejected"（被拒绝），而是一个真正的错误（如内部 panic），
+			// 那么就将它作为错误返回。
 			return nil, diagnosis, s.AsError()
 		}
 		// All nodes in NodeToStatus will have the same status so that they can be handled in the preemption.
+		// 如果状态是 "Rejected"，意味着 PreFilter 插件明确地拒绝了这个 Pod。
+		// 这表示这个 Pod 目前不可调度。
+
+		// 将所有节点的状态都设置为这个失败状态。
+		// 这对于后续的抢占逻辑（preemption）很有用，它会知道这个 Pod 是因为一个全局原因而失败的。
 		diagnosis.NodeToStatus.SetAbsentNodesStatus(s)
 
 		// Record the messages from PreFilter in Diagnosis.PreFilterMsg.
+		// 记录来自 PreFilter 的失败信息到诊断对象中。
 		msg := s.Message()
 		diagnosis.PreFilterMsg = msg
+		// 打印一条详细的日志，说明 PreFilter 阶段失败的原因。
 		logger.V(5).Info("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+		// 将这个失败状态也添加到插件状态列表中，用于生成事件和度量。
 		diagnosis.AddPluginStatus(s)
 		return nil, diagnosis, nil
 	}
 
 	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
 	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
+	// "NominatedNodeName"（提名节点名）可能是在上一个调度周期中，由于抢占（preemption）而被设置的。
+	// 当一个高优先级的 Pod 调度失败时，它可能会“提名”一个节点，并驱逐该节点上的低优先级 Pod，以便为自己腾出空间。
+	// 这个被提名的节点很可能是唯一能满足该 Pod 需求的候选者，因此我们优先尝试它，而不是遍历所有节点。
 	if len(pod.Status.NominatedNodeName) > 0 {
+		// evaluateNominatedNode 函数会只对这个被提名的节点运行所有的 Filter 插件。
 		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, schedFramework, state, diagnosis)
 		if err != nil {
+			// 如果在评估提名节点时发生错误，记录错误但继续往下走，尝试其他节点。
 			utilruntime.HandleErrorWithContext(ctx, err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
 		}
 		// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
+		// 如果提名节点通过了所有的过滤器...
 		if len(feasibleNodes) != 0 {
+			// ...那么就直接返回它作为唯一的可行节点。调度器可以放心地将 Pod 分配给它。
+			// 这是一种重要的优化，可以大大加快被抢占 Pod 的调度速度。
 			return feasibleNodes, diagnosis, nil
 		}
 	}
-
-	nodes := allNodes
+	// 如果没有提名节点，或者提名节点评估失败，那么就开始遍历所有（或部分）节点。
+	nodes := allNodes // 默认情况下，需要检查所有节点。
+	// preRes 是 PreFilter 阶段的返回结果。如果 preRes.AllNodes() 返回 false，
+	// 意味着 PreFilter 插件已经帮我们预筛选出了一部分节点，我们只需要检查这些节点就够了。
 	if !preRes.AllNodes() {
+		// 创建一个新的节点列表，只包含 PreFilter 插件返回的那些节点名。
 		nodes = make([]fwk.NodeInfo, 0, len(preRes.NodeNames))
 		for nodeName := range preRes.NodeNames {
+			// PreFilter 返回的节点名可能已经不存在了（比如节点被删了），所以需要从快照中验证一下。
 			// PreRes may return nodeName(s) which do not exist; we verify
 			// node exists in the Snapshot.
 			if nodeInfo, err := sched.nodeInfoSnapshot.Get(nodeName); err == nil {
 				nodes = append(nodes, nodeInfo)
 			}
 		}
+		// 告诉诊断系统，那些被 PreFilter 插件排除的节点是因为什么原因。
 		diagnosis.NodeToStatus.SetAbsentNodesStatus(fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("node(s) didn't satisfy plugin(s) %v", sets.List(unscheduledPlugins))))
 	}
+	// 这是核心的过滤函数调用。它会并发地对 `nodes` 列表中的每个节点运行所有 Filter 插件。
 	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, nodes)
 	// always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
 	// this is helpful to make sure that all the nodes have a chance to be searched
+	// 为了确保所有节点都有机会被首先检查（而不是每次都从列表第一个开始），调度器会记录上一次遍历结束的位置，
+	// 并从那个位置开始下一次的遍历。这是一种简单的负载均衡，避免某些节点总是被优先考虑。
 	processedNodes := len(feasibleNodes) + diagnosis.NodeToStatus.Len()
 	sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(allNodes)
 	if err != nil {
 		return nil, diagnosis, err
 	}
-
+	// 在通过了所有内置的 Filter 插件后，还需要通过外部扩展调度器（Extenders）的过滤。
+	// Extenders 是一种旧的、允许用户自定义调度逻辑的方式。它是一个外部的 HTTP 服务。
 	feasibleNodesAfterExtender, err := findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatus)
 	if err != nil {
 		return nil, diagnosis, err
 	}
+	// 如果 Extender 过滤掉了一些节点...
 	if len(feasibleNodesAfterExtender) != len(feasibleNodes) {
 		// Extenders filtered out some nodes.
 		//
@@ -554,12 +655,15 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 		// This Pod will be requeued from unschedulable pod pool to activeQ/backoffQ
 		// by any kind of cluster events.
 		// https://github.com/kubernetes/kubernetes/issues/122019
+		// ...我们需要特殊处理，因为 Extender 不支持像框架插件那样的精细化重新排队机制。
+		// 当 Extender 导致 Pod 变得不可调度时，我们将 Extender 的名字加入到 UnschedulablePlugins 列表中。
+		// 这个 Pod 会被放入不可调度队列，等待下一次集群事件（如节点变动）来触发重试。
 		if diagnosis.UnschedulablePlugins == nil {
 			diagnosis.UnschedulablePlugins = sets.New[string]()
 		}
 		diagnosis.UnschedulablePlugins.Insert(framework.ExtenderName)
 	}
-
+	// 返回最终通过了所有内置插件和外部扩展程序过滤的节点列表。
 	return feasibleNodesAfterExtender, diagnosis, nil
 }
 

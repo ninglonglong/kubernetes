@@ -941,6 +941,9 @@ func (f *frameworkImpl) runFilterPlugin(ctx context.Context, pl framework.Filter
 
 // RunPostFilterPlugins runs the set of configured PostFilter plugins until the first
 // Success, Error or UnschedulableAndUnresolvable is met; otherwise continues to execute all plugins.
+// RunPostFilterPlugins 运行已配置的 PostFilter 插件集合。
+// 它会一直运行，直到遇到第一个返回 Success、Error 或 UnschedulableAndUnresolvable 状态的插件；
+// 否则，它会继续执行所有插件。
 func (f *frameworkImpl) RunPostFilterPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, filteredNodeStatusMap framework.NodeToStatusReader) (_ *framework.PostFilterResult, status *fwk.Status) {
 	startTime := time.Now()
 	defer func() {
@@ -963,26 +966,42 @@ func (f *frameworkImpl) RunPostFilterPlugins(ctx context.Context, state fwk.Cycl
 			logger := klog.LoggerWithName(logger, pl.Name())
 			ctx = klog.NewContext(ctx, logger)
 		}
+		// ... 为每个插件创建带名称的日志上下文 ...
+
+		// 运行单个 PostFilter 插件。
+		// `filteredNodeStatusMap` 包含了每个节点在 Filter 阶段失败的原因，这对于 PostFilter 插件做决策至关重要。
 		r, s := f.runPostFilterPlugin(ctx, pl, state, pod, filteredNodeStatusMap)
 		if s.IsSuccess() {
+			// 如果一个插件返回了 Success，意味着它成功地处理了这种情况（比如，它提名了一个节点进行抢占）。
+			// 不需要再运行其他 PostFilter 插件了，直接返回成功的结果。
 			return r, s
 		} else if s.Code() == fwk.UnschedulableAndUnresolvable {
+			// 如果插件返回 "不可调度且无法解决"，这是一个非常强的失败信号。
+			// 意味着问题很严重，连抢占都解决不了。直接返回这个失败状态。
 			return r, s.WithPlugin(pl.Name())
 		} else if !s.IsRejected() {
 			// Any status other than Success, Unschedulable or UnschedulableAndUnresolvable is Error.
+			// 如果插件返回的既不是 Success，也不是 Unschedulable/UnschedulableAndUnresolvable，
+			// 也不是 Rejected，那它就是一个内部错误 (Error)。
+			// 立即返回这个错误。
 			return nil, fwk.AsStatus(s.AsError()).WithPlugin(pl.Name())
 		} else if r != nil && r.Mode() != framework.ModeNoop {
+			// 如果插件返回了 "Rejected" (或 Unschedulable) 状态，但同时提供了一个非空操作的结果（result），
+			// 我们就先把它存起来。这可能是多个插件都想做某件事，但我们可能只采纳其中一个。
 			result = r
 		}
-
+		// 收集所有插件返回的失败原因，用于最终的诊断信息。
 		reasons = append(reasons, s.Reasons()...)
 		// Record the first failed plugin unless we proved that
 		// the latter is more relevant.
+		// 记录第一个返回失败状态的插件的名称。
 		if len(rejectorPlugin) == 0 {
 			rejectorPlugin = pl.Name()
 		}
 	}
-
+	// 如果遍历完了所有 PostFilter 插件，都没有一个能成功处理（比如成功发起抢占），
+	// 那么就认为这个 Pod 最终还是不可调度的。
+	// 将所有收集到的失败原因汇总，并以第一个失败的插件作为代表，返回一个总的 "Unschedulable" 状态
 	return result, fwk.NewStatus(fwk.Unschedulable, reasons...).WithPlugin(rejectorPlugin)
 }
 

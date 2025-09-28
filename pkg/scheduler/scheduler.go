@@ -521,11 +521,18 @@ func buildQueueingHintMap(ctx context.Context, es []framework.EnqueueExtensions)
 }
 
 // Run begins watching and scheduling. It starts scheduling and blocked until the context is done.
+// Run 方法启动了 scheduler 的核心调度循环。
 func (sched *Scheduler) Run(ctx context.Context) {
+	// 从上下文中获取日志记录器。
 	logger := klog.FromContext(ctx)
+	// 启动调度队列。
+	// SchedulingQueue.Run() 内部会启动一些后台 goroutine，
+	// 负责管理 activeQ（待处理队列）、backoffQ（退避队列）和 unschedulableQ（不可调度队列）之间的 Pod 移动。
+	// 比如，它会定期检查 unschedulableQ 中的 Pod，看它们是否可以被移回 activeQ 重试。
 	sched.SchedulingQueue.Run(logger)
-
+	// 如果 API Dispatcher (用于异步 API 调用) 被启用...
 	if sched.APIDispatcher != nil {
+		// ...也启动它。它内部可能也包含一些后台工作 goroutine。
 		sched.APIDispatcher.Run(logger)
 	}
 
@@ -535,9 +542,21 @@ func (sched *Scheduler) Run(ctx context.Context) {
 	// If there are no new pods to schedule, it will be hanging there
 	// and if done in this goroutine it will be blocking closing
 	// SchedulingQueue, in effect causing a deadlock on shutdown.
+	// 我们必须在一个专门的 goroutine 中启动 scheduleOne 循环。
+	// 这是因为 scheduleOne 函数会阻塞在从 SchedulingQueue 获取下一个任务的地方。
+	// (sched.NextPod() 会一直等待，直到队列中有新的 Pod)
+	// 如果没有新的 Pod 需要调度，它就会一直挂在那里。
+	// 如果把这个循环放在当前的 goroutine 中执行，当需要关闭 scheduler 时，
+	// 主 goroutine 会被阻塞，无法执行 sched.SchedulingQueue.Close()，
+	// 最终导致死锁。
 	go wait.UntilWithContext(ctx, sched.ScheduleOne, 0)
 
+	// --- 程序会阻塞在这里，直到整个 scheduler 的生命周期结束 ---
+	// <-ctx.Done() 会一直等待，直到传入的上下文 ctx 被取消。
+	// ctx 通常会在收到 SIGTERM/SIGINT 等操作系统信号时被取消，表示程序需要关闭。
 	<-ctx.Done()
+
+	// 如果 API Dispatcher 被启用，关闭它。
 	if sched.APIDispatcher != nil {
 		sched.APIDispatcher.Close()
 	}
@@ -553,7 +572,12 @@ func (sched *Scheduler) Run(ctx context.Context) {
 // NewInformerFactory creates a SharedInformerFactory and initializes a scheduler specific
 // in-place podInformer.
 func NewInformerFactory(cs clientset.Interface, resyncPeriod time.Duration) informers.SharedInformerFactory {
+	// 首先，创建一个标准的、通用的 SharedInformerFactory。
+	// 在这一刻，这个工厂对于如何创建各种 Informer（如 Pod, Node, Service）都使用的是默认的逻辑。
 	informerFactory := informers.NewSharedInformerFactory(cs, resyncPeriod)
+	// 这是关键的“偷天换日”步骤。
+	// InformerFor 方法允许我们为一个特定的资源类型（这里是 *v1.Pod）
+	// 注册一个自定义的 Informer 构造函数。
 	informerFactory.InformerFor(&v1.Pod{}, newPodInformer)
 	return informerFactory
 }
