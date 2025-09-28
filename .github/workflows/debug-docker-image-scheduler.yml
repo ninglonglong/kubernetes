@@ -1,6 +1,6 @@
 # .github/workflows/build-debug-image.yml
 
-name: Build K8s DEBUG Image and Push to ACR
+name: Build K8s DEBUG Image and Push to ACR scheduler
 
 on:
   # 只允许手动触发，因为调试镜像是按需构建的
