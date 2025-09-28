@@ -1,0 +1,96 @@
+# .github/workflows/build-debug-image.yml
+
+name: Build K8s DEBUG Image and Push to ACR
+
+on:
+  # 只允许手动触发，因为调试镜像是按需构建的
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Debug image tag (e.g., dev-debug, latest)'
+        required: true
+        default: 'debug-latest'
+      k8s_component:
+        description: 'The Kubernetes component to build for debugging'
+        required: true
+        default: 'kube-scheduler' # 默认为 apiserver
+
+# 定义环境变量
+env:
+  ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
+  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
+  ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
+  ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+
+jobs:
+  build-debug-image:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 检出代码
+      - name: Checkout Kubernetes source code
+        uses: actions/checkout@v4
+
+      # 2. 设置 Go 环境
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # 确保与您的 k8s 版本匹配
+
+      # 3. 编译带调试信息的二进制文件
+      - name: Build K8s component with debug flags
+        run: |
+          echo "Building ${{ github.event.inputs.k8s_component }} with debug flags..."
+          # 这是最关键的一步：-gcflags="all=-N -l" 关闭了所有编译优化
+          go build -gcflags="all=-N -l" -o ./_output/${{ github.event.inputs.k8s_component }}-debug k8s.io/kubernetes/cmd/${{ github.event.inputs.k8s_component }}
+          echo "Build complete."
+
+      # 4. 安装 Delve (dlv) 调试器
+      - name: Install Delve for Linux
+        run: |
+          go install github.com/go-delve/delve/cmd/dlv@latest
+          # 将编译好的 dlv 复制到输出目录，方便打包
+          cp $(go env GOPATH)/bin/dlv ./_output/dlv
+          echo "Delve installed and copied."
+
+      # 5. 登录到阿里云 ACR
+      - name: Log in to Alibaba Cloud Container Registry (ACR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ env.ALIYUN_REGISTRY_USER }}
+          password: ${{ env.ALIYUN_REGISTRY_PASSWORD }}
+
+      # 6. 构建并推送最终的调试镜像
+      - name: Build and Push Debug Image
+        run: |
+          COMPONENT_NAME="${{ github.event.inputs.k8s_component }}"
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          
+          # 动态创建一个 Dockerfile 用于构建调试镜像
+          cat <<EOF > ./_output/Dockerfile.debug
+          FROM ubuntu:22.04
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+          net-tools \
+          procps \
+          && rm -rf /var/lib/apt/lists/*
+          
+          # 将带调试信息的组件二进制文件和 dlv 复制到镜像中
+          COPY ./${COMPONENT_NAME}-debug /usr/local/bin/${COMPONENT_NAME}
+          COPY ./dlv /dlv
+          
+          # 添加执行权限
+          RUN chmod +x /usr/local/bin/${COMPONENT_NAME} /dlv
+          EOF
+
+          echo "Building debug image..."
+          docker build -t "${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${COMPONENT_NAME}-debug:${IMAGE_TAG}" -f ./_output/Dockerfile.debug ./_output
+          
+          echo "Pushing debug image..."
+          docker push "${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${COMPONENT_NAME}-debug:${IMAGE_TAG}"
+          echo "Debug image pushed successfully!"
+
+      # 7. 登出 ACR
+      - name: Logout from ACR
+        if: always()
+        run: docker logout ${{ env.ALIYUN_REGISTRY }}
+
